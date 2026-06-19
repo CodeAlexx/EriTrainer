@@ -79,6 +79,10 @@ sd35, see `needs_generated_config`) auto-write an EDv2-schema `TrainConfig` JSON
 from the form (`write_runner_config` → `RunnerConfig`, mirrors the example configs)
 when Run Config is empty. A user-set Run Config path is left untouched.
 
+**Config save/load**: `config.rs::{save_to, load_from, configs_dir,
+list_saved_configs}` persist the UI `TrainConfig` as JSON under
+`~/.config/eritrainer/configs/`; the General tab's CONFIG panel saves/loads them.
+
 ## 5. Where to start — add a model
 
 1. `awk '/struct Args/{f=1} f{print} /^}/{if(f)exit}' <EDv2>/crates/eridiffusion-cli/src/bin/train_<m>.rs | grep -E "^\s{4}[a-z_]+:"` — get the EXACT field list (the `-B1 grep` trick MISSES doc-commented args; use awk).

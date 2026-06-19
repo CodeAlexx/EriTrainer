@@ -3,10 +3,56 @@
 
 use eframe::egui;
 
-use crate::config::{device_options, precision_options, TrainConfig};
+use crate::config::{
+    configs_dir, device_options, list_saved_configs, precision_options, TrainConfig,
+};
 use crate::widgets::{combo_str_row, drag_row, edit_row, field_row, form_panel, toggle_row};
 
 pub fn render(ui: &mut egui::Ui, cfg: &mut TrainConfig) {
+    form_panel(ui, "CONFIG", "Save / load this run configuration", |ui| {
+        // Honest inline status: success OR the actual error, persisted via egui
+        // temp memory so a failed save/load never reads as if it worked.
+        let status_id = egui::Id::new("eritrainer_cfg_status");
+        ui.horizontal(|ui| {
+            if ui.button("Save config").clicked() {
+                let n = cfg.run_name.trim();
+                let name = if n.is_empty() { "untitled" } else { n };
+                let path = configs_dir().join(format!("{name}.json"));
+                let msg = match cfg.save_to(&path) {
+                    Ok(()) => format!("saved → {}", path.display()),
+                    Err(e) => format!("SAVE FAILED: {e}"),
+                };
+                ui.data_mut(|d| d.insert_temp(status_id, msg));
+            }
+            if let Some(msg) = ui.data(|d| d.get_temp::<String>(status_id)) {
+                ui.label(egui::RichText::new(msg).weak());
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!("dir: {}", configs_dir().display()))
+                .weak()
+                .small(),
+        );
+        ui.separator();
+        let saved = list_saved_configs();
+        if saved.is_empty() {
+            ui.label(egui::RichText::new("no saved configs yet").weak());
+        }
+        for (name, path) in saved {
+            ui.horizontal(|ui| {
+                if ui.button("Load").clicked() {
+                    match TrainConfig::load_from(&path) {
+                        Ok(loaded) => *cfg = loaded,
+                        Err(e) => {
+                            ui.data_mut(|d| d.insert_temp(status_id, format!("LOAD FAILED: {e}")));
+                        }
+                    }
+                }
+                ui.label(&name);
+            });
+        }
+    });
+
     form_panel(ui, "WORKSPACE", "Paths, cache policy, and safety", |ui| {
         edit_row(ui, "Workspace", &mut cfg.workspace_dir);
         edit_row(ui, "Cache", &mut cfg.cache_dir);

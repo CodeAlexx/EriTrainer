@@ -1041,6 +1041,71 @@ impl TrainConfig {
     }
 }
 
+// --- Config persistence (save/load the UI config as JSON) ---
+
+impl TrainConfig {
+    /// Serialize this config to `path` (creates parent dirs).
+    pub fn save_to(&self, path: &std::path::Path) -> Result<(), String> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir: {e}"))?;
+        }
+        let json = serde_json::to_string_pretty(self).map_err(|e| format!("serialize: {e}"))?;
+        std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
+    }
+
+    /// Load a config from `path`.
+    pub fn load_from(path: &std::path::Path) -> Result<TrainConfig, String> {
+        let text = std::fs::read_to_string(path)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))
+    }
+}
+
+/// Directory where saved UI configs live (`$HOME/.config/eritrainer/configs`).
+pub fn configs_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| String::from("."));
+    std::path::PathBuf::from(home).join(".config/eritrainer/configs")
+}
+
+/// List saved configs as (name, path), sorted by name.
+pub fn list_saved_configs() -> Vec<(String, std::path::PathBuf)> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(configs_dir()) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().map_or(false, |x| x == "json") {
+                if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                    out.push((stem.to_string(), p.clone()));
+                }
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+
+    #[test]
+    fn config_save_load_roundtrip() {
+        let mut cfg = TrainConfig::default();
+        cfg.run_name = "roundtrip_test".into();
+        cfg.model_type = "klein".into();
+        cfg.learning_rate = 1.23e-4;
+        cfg.lora_rank = 24.0;
+        let path = std::env::temp_dir().join("eritrainer_cfg_roundtrip.json");
+        cfg.save_to(&path).expect("save");
+        let loaded = TrainConfig::load_from(&path).expect("load");
+        assert_eq!(loaded.run_name, "roundtrip_test");
+        assert_eq!(loaded.model_type, "klein");
+        assert!((loaded.learning_rate - 1.23e-4).abs() < 1e-9);
+        assert!((loaded.lora_rank - 24.0).abs() < 1e-6);
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
 #[cfg(test)]
 mod preset_tests {
     use super::*;

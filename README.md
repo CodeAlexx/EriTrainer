@@ -61,8 +61,10 @@ and the schedule on **Training**, then **Start training**.
 - **Runner `--config` generation**: models whose trainer requires `--config`
   (klein/ernie/anima/sd35) auto-write an EDv2 `TrainConfig` JSON from the form
   when you haven't supplied a Run Config path.
+- **Config save/load**: the General tab can save the current run config to
+  `~/.config/eritrainer/configs/<run_name>.json` and reload any saved config.
 - Remaining: the deferred/video models (flux, qwen, wan22, ltx2, …); file/folder
-  pickers; config save/load; a polished live-GUI pass.
+  pickers (native dialogs); a polished live-GUI pass.
 
 See `MAP.md` for the code map + add-a-model recipe and `ERITRAINER_PLAN.md` for the
 full build spec.
