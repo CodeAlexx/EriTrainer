@@ -345,9 +345,10 @@ pub fn build_command(cfg: &TrainConfig) -> Result<(String, Vec<String>), String>
         "klein" => ("train_klein", klein_args(cfg)?),
         "sdxl" => ("train_sdxl", sdxl_args(cfg)?),
         "zimage" => ("train_zimage", zimage_args(cfg)?),
+        "chroma" => ("train_chroma", chroma_args(cfg)?),
         other => {
             return Err(format!(
-                "launch for model '{other}' is not wired yet (wired: klein, sdxl, zimage)"
+                "launch for model '{other}' is not wired yet (wired: klein, sdxl, zimage, chroma)"
             ))
         }
     };
@@ -499,6 +500,54 @@ fn zimage_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
     Ok(a)
 }
 
+/// Chroma argv mirroring `train_chroma.rs` clap flags. Checkpoint flag is
+/// `--transformer` (like Klein); `--config` is OPTIONAL; supports `--offload`;
+/// has NO `--batch-size` (unlike Klein/Z-Image). Fails loud on missing
+/// `--cache-dir` / `--transformer`.
+fn chroma_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    if cfg.cache_dir.trim().is_empty() {
+        return Err(String::from("cache dir (--cache-dir) is required"));
+    }
+    if cfg.base_model_path.trim().is_empty() {
+        return Err(String::from("base model path (--transformer) is required"));
+    }
+    let mut a: Vec<String> = Vec::new();
+    if !cfg.run_config_path.trim().is_empty() {
+        a.push("--config".into());
+        a.push(cfg.run_config_path.clone());
+    }
+    a.push("--cache-dir".into());
+    a.push(cfg.cache_dir.clone());
+    a.push("--transformer".into());
+    a.push(cfg.base_model_path.clone());
+    a.push("--steps".into());
+    a.push((cfg.max_train_steps.max(1.0) as u64).to_string());
+    a.push("--rank".into());
+    a.push((cfg.lora_rank.max(1.0) as u64).to_string());
+    a.push("--lora-alpha".into());
+    a.push(cfg.lora_alpha.to_string());
+    a.push("--lr".into());
+    a.push(cfg.learning_rate.to_string());
+    a.push("--warmup-steps".into());
+    a.push((cfg.learning_rate_warmup_steps.max(0.0) as u64).to_string());
+    if !cfg.output_dir.trim().is_empty() {
+        a.push("--output-dir".into());
+        a.push(cfg.output_dir.clone());
+    }
+    if cfg.activation_offloading {
+        a.push("--offload".into());
+    }
+    if cfg.min_snr_gamma_flow > 0.0 {
+        a.push("--min-snr-gamma".into());
+        a.push(cfg.min_snr_gamma_flow.to_string());
+    }
+    if cfg.caption_dropout > 0.0 {
+        a.push("--caption-dropout-probability".into());
+        a.push(cfg.caption_dropout.to_string());
+    }
+    Ok(a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -565,6 +614,21 @@ mod tests {
         assert!((s.grad_norm - 0.0076).abs() < 1e-6, "grad={}", s.grad_norm);
         assert!((s.speed_s_step - 5.3).abs() < 1e-6, "speed={}", s.speed_s_step);
         assert_eq!(s.eta_secs, 10);
+    }
+
+    #[test]
+    fn parses_real_train_chroma_run_line() {
+        // Captured verbatim from a real `target/release/train_chroma` run
+        // (3-step smoke on an 8-sample 512px cache, 2026-06-19).
+        let line = "[Chroma-lora] step 1/3 | epoch 1/1 | loss 0.4617 | grad_norm 0.0061 | 8.5s/step | elapsed 0:00:08 | ETA 0:00:16";
+        let mut s = LiveStats::default();
+        assert!(parse_progress_line(line, &mut s));
+        assert_eq!(s.step, 1);
+        assert_eq!(s.total_steps, 3);
+        assert!((s.loss - 0.4617).abs() < 1e-6, "loss={}", s.loss);
+        assert!((s.grad_norm - 0.0061).abs() < 1e-6, "grad={}", s.grad_norm);
+        assert!((s.speed_s_step - 8.5).abs() < 1e-6, "speed={}", s.speed_s_step);
+        assert_eq!(s.eta_secs, 16);
     }
 
     #[test]
@@ -688,5 +752,30 @@ mod tests {
         cfg.model_type = "zimage".into();
         cfg.cache_dir = "/cache/z".into();
         assert!(zimage_args(&cfg).is_err());
+    }
+
+    #[test]
+    fn chroma_args_uses_transformer_and_omits_batch_size() {
+        let mut cfg = TrainConfig::default();
+        cfg.architecture_index = 4;
+        cfg.apply_model_preset(false); // chroma
+        cfg.cache_dir = "/cache/chroma".into();
+        cfg.base_model_path = "/models/chroma1hd.safetensors".into();
+        cfg.max_train_steps = 250.0;
+        let joined = chroma_args(&cfg).expect("chroma args ok").join(" ");
+        assert!(joined.contains("--transformer /models/chroma1hd.safetensors"), "{joined}");
+        assert!(joined.contains("--cache-dir /cache/chroma"), "{joined}");
+        assert!(joined.contains("--steps 250"), "{joined}");
+        assert!(!joined.contains("--batch-size"), "train_chroma has no --batch-size: {joined}");
+        assert!(!joined.contains("--unet"), "{joined}");
+        assert!(!joined.contains("--model "), "chroma uses --transformer: {joined}");
+    }
+
+    #[test]
+    fn chroma_args_fails_loud_on_missing_transformer() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "chroma".into();
+        cfg.cache_dir = "/cache/chroma".into();
+        assert!(chroma_args(&cfg).is_err());
     }
 }
