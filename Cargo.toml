@@ -1,0 +1,27 @@
+[package]
+name = "eritrainer"
+version = "0.1.0"
+edition = "2021"
+description = "EriTrainer — native egui training UI for the EriDiffusion-v2 Rust trainers (mirrors the Mojo serenity-trainer UI)."
+
+[[bin]]
+name = "eritrainer"
+path = "src/main.rs"
+
+[dependencies]
+# Pinned to the versions cached locally (offline build). glow backend only —
+# no wgpu, no accesskit — to keep the dependency surface minimal.
+# x11 + wayland are REQUIRED on Linux: without a windowing backend feature,
+# winit's platform_impl is empty and fails to compile. glow (not wgpu) keeps
+# the GPU surface light. accesskit/web are intentionally left off.
+eframe = { version = "=0.31.1", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
+egui = "=0.31.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+
+# NOTE: EriTrainer deliberately does NOT depend on eridiffusion-core. It is a
+# launcher UI — it writes a runner config JSON and spawns the existing EDv2
+# `train_*` binaries by path, then tails their stdout progress line. Keeping
+# the CUDA/flame-core stack out of the UI build means it compiles without a GPU
+# toolchain. (Same separation the Mojo serenity-trainer UI keeps.)
