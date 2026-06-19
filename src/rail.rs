@@ -26,11 +26,19 @@ pub fn status_rail(ui: &mut egui::Ui, rt: &Runtime) {
     status_pill(ui, rt);
     ui.add_space(6.0);
 
-    ui.add(
-        egui::ProgressBar::new(rt.progress_fraction())
-            .show_percentage()
-            .fill(theme::ACCENT),
-    );
+    if rt.has_running {
+        ui.add(
+            egui::ProgressBar::new(rt.progress_fraction())
+                .show_percentage()
+                .fill(theme::ACCENT),
+        );
+    } else {
+        // Idle: a flat empty track. egui's ProgressBar draws a rounded orange
+        // nub for a 0% fill (reads as a stray circle); the Mojo rail has none.
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 3.0, theme::RAISED);
+    }
     ui.add_space(8.0);
     ui.separator();
 

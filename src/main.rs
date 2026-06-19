@@ -35,7 +35,14 @@ fn main() -> eframe::Result<()> {
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);
-            Ok(Box::new(EriTrainerApp::default()))
+            let mut app = EriTrainerApp::default();
+            // Screenshot/testing hook: open on a named section.
+            if let Ok(name) = std::env::var("ERITRAINER_SECTION") {
+                if let Some(s) = Section::from_name(&name) {
+                    app.section = s;
+                }
+            }
+            Ok(Box::new(app))
         }),
     )
 }
@@ -71,7 +78,7 @@ impl eframe::App for EriTrainerApp {
 
         egui::CentralPanel::default().show(ctx, |ui| {
             egui::ScrollArea::vertical().show(ui, |ui| {
-                tabs::render(self.section, ui, &mut self.cfg);
+                tabs::render(self.section, ui, &mut self.cfg, &self.rt);
             });
         });
 

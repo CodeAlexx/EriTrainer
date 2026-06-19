@@ -50,6 +50,25 @@ impl Section {
         Section::Logs,
     ];
 
+    /// Resolve a section by name (for the `ERITRAINER_SECTION` screenshot hook).
+    pub fn from_name(s: &str) -> Option<Section> {
+        Some(match s.trim().to_lowercase().as_str() {
+            "general" => Section::General,
+            "model" => Section::Model,
+            "lora" | "lora/oft" | "oft" => Section::Lora,
+            "dataset" => Section::Dataset,
+            "captioner" => Section::Captioner,
+            "validations" | "concepts" => Section::Validations,
+            "training" => Section::Training,
+            "sampling" => Section::Sampling,
+            "backup" => Section::Backup,
+            "cloud" => Section::Cloud,
+            "runs" => Section::Runs,
+            "logs" => Section::Logs,
+            _ => return None,
+        })
+    }
+
     pub fn label(&self) -> &'static str {
         match self {
             Section::General => "General",
