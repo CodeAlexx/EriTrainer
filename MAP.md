@@ -35,6 +35,7 @@ TopBar "Start" → Runtime::start(cfg)
   → (if needs_generated_config(model_type) && Run Config empty)
       write_runner_config(cfg)      # emit EDv2 TrainConfig JSON from the form → set --config
   → build_command(eff)              # dispatch on cfg.model_type → (program, args)
+                                    #   + sample_flags(cfg) appended (in-trainer --sample-*)
       → <model>_args(cfg)           # per-model clap-flag mapping; fail-loud on missing paths
       → resolve_launcher(bin)       # prebuilt target/{release,debug}/<bin>, else `cargo run`
   → Command + launch_env(cfg)       # libtorch on LD_LIBRARY_PATH, RUST_LOG, klein FLAME flags
@@ -82,6 +83,16 @@ when Run Config is empty. A user-set Run Config path is left untouched.
 **Config save/load**: `config.rs::{save_to, load_from, configs_dir,
 list_saved_configs}` persist the UI `TrainConfig` as JSON under
 `~/.config/eritrainer/configs/`; the General tab's CONFIG panel saves/loads them.
+
+**In-trainer sampling**: `runtime.rs::sample_flags(cfg)` emits the per-model
+`--sample-*` set from the Sampling tab (Sample After + prompts + the SAMPLE
+ASSETS card: VAE/Encoder/Tokenizer). Asset-flag NAMES differ per model
+(klein/zimage `--sample-qwen3`, chroma `--sample-t5`, ernie `--sample-text-ckpt`,
+l2p `--sample-qwen3` no-VAE, hidream `--sample-every` only). Emits
+`--sample-every 0` to DISABLE when off / assets missing (trainers default it on).
+**sdxl/anima** have NO in-trainer sampling (separate `sample_<m>` bin → emit
+nothing); **sd35** needs a 3-encoder set not modeled yet. Verified live: klein +
+zimage produce real sample images.
 
 ## 5. Where to start — add a model
 

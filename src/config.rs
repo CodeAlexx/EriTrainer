@@ -423,6 +423,11 @@ pub struct TrainConfig {
     pub sampler_preset: String,
     pub samples_to_tensorboard: bool,
     pub non_ema_sampling: bool,
+    // In-trainer sample-asset paths (consumed by the *_args sample wiring).
+    pub sample_size: f32,
+    pub sample_vae_path: String,
+    pub sample_encoder_path: String,
+    pub sample_tokenizer_path: String,
 
     // --- Backup ---
     pub backup_after: f32,
@@ -626,6 +631,10 @@ impl Default for TrainConfig {
             sampler_preset: String::from("KLEIN_20"),
             samples_to_tensorboard: true,
             non_ema_sampling: false,
+            sample_size: 512.0,
+            sample_vae_path: String::new(),
+            sample_encoder_path: String::new(),
+            sample_tokenizer_path: String::new(),
 
             backup_after: 500.0,
             rolling_backup: true,

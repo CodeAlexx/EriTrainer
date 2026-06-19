@@ -464,7 +464,92 @@ pub fn build_command(cfg: &TrainConfig) -> Result<(String, Vec<String>), String>
     };
     let (program, mut full) = resolve_launcher(bin);
     full.extend(args);
+    full.extend(sample_flags(cfg));
     Ok((program, full))
+}
+
+/// In-trainer sampling flags from the Sampling-tab fields. Per-model: the
+/// asset-flag names differ, hidream takes ONLY `--sample-every`, and sdxl/anima
+/// have NO in-trainer sampling (separate `sample_<m>` bin) so emit nothing.
+/// Always emits `--sample-every 0` to DISABLE when sampling is off or a required
+/// sample asset is missing — several trainers default `--sample-every` to
+/// non-zero, which would otherwise try to sample with no assets and fail.
+fn sample_flags(cfg: &TrainConfig) -> Vec<String> {
+    // No in-trainer sampling flag exists for these — never emit anything.
+    if matches!(cfg.model_type.as_str(), "sdxl" | "anima") {
+        return Vec::new();
+    }
+    let off = vec![String::from("--sample-every"), String::from("0")];
+    let every = cfg.sample_after.max(0.0) as u64;
+    if every == 0 {
+        return off; // sampling disabled in the UI
+    }
+    // HiDream-O1 takes only --sample-every (prompt/assets come from --model-path).
+    if cfg.model_type == "hidream" {
+        return vec![String::from("--sample-every"), every.to_string()];
+    }
+    let prompt = cfg
+        .samples
+        .first()
+        .map(|s| s.prompt.trim().to_string())
+        .unwrap_or_default();
+    if prompt.is_empty() {
+        return off; // no sample prompt set
+    }
+    let vae = cfg.sample_vae_path.trim();
+    let enc = cfg.sample_encoder_path.trim();
+    let tok = cfg.sample_tokenizer_path.trim();
+    let pair = |f: &str, v: &str| vec![f.to_string(), v.to_string()];
+    let assets: Vec<String> = match cfg.model_type.as_str() {
+        "klein" | "zimage" => {
+            if vae.is_empty() || enc.is_empty() || tok.is_empty() {
+                return off;
+            }
+            [pair("--sample-vae", vae), pair("--sample-qwen3", enc), pair("--sample-tokenizer", tok)].concat()
+        }
+        "chroma" => {
+            if vae.is_empty() || enc.is_empty() || tok.is_empty() {
+                return off;
+            }
+            [pair("--sample-vae", vae), pair("--sample-t5", enc), pair("--sample-t5-tokenizer", tok)].concat()
+        }
+        "ernie" => {
+            if vae.is_empty() || enc.is_empty() || tok.is_empty() {
+                return off;
+            }
+            [pair("--sample-vae", vae), pair("--sample-text-ckpt", enc), pair("--sample-tokenizer", tok)].concat()
+        }
+        "l2p" => {
+            if enc.is_empty() || tok.is_empty() {
+                return off; // pixel-space: no VAE
+            }
+            [pair("--sample-qwen3", enc), pair("--sample-tokenizer", tok)].concat()
+        }
+        // sd35 needs a 3-encoder + 3-tokenizer asset set not modeled in the UI yet.
+        _ => return off,
+    };
+    let mut a = vec![
+        String::from("--sample-every"),
+        every.to_string(),
+        String::from("--sample-prompt"),
+        prompt,
+        String::from("--sample-size"),
+        (cfg.sample_size.max(64.0) as u64).to_string(),
+        String::from("--sample-steps"),
+        (cfg.sample_steps.max(1.0) as u64).to_string(),
+        String::from("--sample-cfg"),
+        cfg.sample_cfg.to_string(),
+    ];
+    if let Some(s) = cfg.samples.first() {
+        if !s.negative_prompt.trim().is_empty() {
+            a.push(String::from("--sample-neg-prompt"));
+            a.push(s.negative_prompt.clone());
+        }
+        a.push(String::from("--sample-seed"));
+        a.push((s.seed.max(0) as u64).to_string());
+    }
+    a.extend(assets);
+    a
 }
 
 /// Klein argv mirroring `train_klein.rs` clap flags. Fails loud on any missing
@@ -1099,8 +1184,68 @@ mod tests {
     #[test]
     fn build_command_rejects_unwired_model() {
         let mut cfg = TrainConfig::default();
-        cfg.model_type = "chroma".into(); // not yet wired
+        cfg.model_type = "wan22".into(); // genuinely not wired (video, deferred)
         assert!(build_command(&cfg).is_err());
+    }
+
+    #[test]
+    fn sample_flags_disabled_emits_off() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "klein".into();
+        cfg.sample_after = 0.0;
+        assert_eq!(sample_flags(&cfg), vec!["--sample-every", "0"]);
+    }
+
+    #[test]
+    fn sample_flags_klein_enabled_with_assets() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "klein".into();
+        cfg.sample_after = 200.0;
+        cfg.sample_vae_path = "/vae.safetensors".into();
+        cfg.sample_encoder_path = "/qwen3".into();
+        cfg.sample_tokenizer_path = "/tok.json".into();
+        cfg.samples = vec![crate::config::Sample {
+            prompt: "a cat".into(),
+            negative_prompt: String::new(),
+            seed: 42,
+        }];
+        let j = sample_flags(&cfg).join(" ");
+        assert!(j.contains("--sample-every 200"), "{j}");
+        assert!(j.contains("--sample-prompt a cat"), "{j}");
+        assert!(j.contains("--sample-vae /vae.safetensors"), "{j}");
+        assert!(j.contains("--sample-qwen3 /qwen3"), "{j}");
+        assert!(j.contains("--sample-tokenizer /tok.json"), "{j}");
+    }
+
+    #[test]
+    fn sample_flags_enabled_but_missing_assets_disables() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "klein".into();
+        cfg.sample_after = 200.0; // on, but no asset paths set
+        cfg.samples = vec![crate::config::Sample {
+            prompt: "a cat".into(),
+            negative_prompt: String::new(),
+            seed: 1,
+        }];
+        assert_eq!(sample_flags(&cfg), vec!["--sample-every", "0"]);
+    }
+
+    #[test]
+    fn sample_flags_hidream_only_every() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "hidream".into();
+        cfg.sample_after = 100.0;
+        assert_eq!(sample_flags(&cfg), vec!["--sample-every", "100"]);
+    }
+
+    #[test]
+    fn sample_flags_sdxl_and_anima_emit_nothing() {
+        let mut cfg = TrainConfig::default();
+        cfg.sample_after = 100.0;
+        for m in ["sdxl", "anima"] {
+            cfg.model_type = m.into();
+            assert!(sample_flags(&cfg).is_empty(), "{m} must emit no --sample-* flags");
+        }
     }
 
     #[test]
