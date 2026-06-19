@@ -350,9 +350,10 @@ pub fn build_command(cfg: &TrainConfig) -> Result<(String, Vec<String>), String>
         "anima" => ("train_anima", anima_args(cfg)?),
         // model_type "hidream" -> bin train_hidream_o1 (name reconciliation).
         "hidream" => ("train_hidream_o1", hidream_args(cfg)?),
+        "sd35" => ("train_sd35", sd35_args(cfg)?),
         other => {
             return Err(format!(
-                "launch for model '{other}' is not wired yet (wired: klein, sdxl, zimage, chroma, ernie, anima, hidream)"
+                "launch for model '{other}' is not wired yet (wired: klein, sdxl, zimage, chroma, ernie, anima, hidream, sd35)"
             ))
         }
     };
@@ -684,6 +685,55 @@ fn hidream_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
     Ok(a)
 }
 
+/// SD3.5 argv mirroring `train_sd35.rs` clap flags. Checkpoint flag is
+/// `--transformer`; `--config` is REQUIRED (base TrainConfig); HAS `--batch-size`
+/// + `--warmup-steps` + `--min-snr-gamma`; NO `--offload`. Fails loud on missing
+/// `--config` / `--cache-dir` / `--transformer`.
+fn sd35_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    if cfg.run_config_path.trim().is_empty() {
+        return Err(String::from("run config path (--config) is required"));
+    }
+    if cfg.cache_dir.trim().is_empty() {
+        return Err(String::from("cache dir (--cache-dir) is required"));
+    }
+    if cfg.base_model_path.trim().is_empty() {
+        return Err(String::from("base model path (--transformer) is required"));
+    }
+    let mut a: Vec<String> = vec![
+        "--config".into(),
+        cfg.run_config_path.clone(),
+        "--cache-dir".into(),
+        cfg.cache_dir.clone(),
+        "--transformer".into(),
+        cfg.base_model_path.clone(),
+        "--steps".into(),
+        (cfg.max_train_steps.max(1.0) as u64).to_string(),
+        "--rank".into(),
+        (cfg.lora_rank.max(1.0) as u64).to_string(),
+        "--lora-alpha".into(),
+        cfg.lora_alpha.to_string(),
+        "--lr".into(),
+        cfg.learning_rate.to_string(),
+        "--batch-size".into(),
+        (cfg.batch_size.max(1.0) as u64).to_string(),
+        "--warmup-steps".into(),
+        (cfg.learning_rate_warmup_steps.max(0.0) as u64).to_string(),
+    ];
+    if !cfg.output_dir.trim().is_empty() {
+        a.push("--output-dir".into());
+        a.push(cfg.output_dir.clone());
+    }
+    if cfg.min_snr_gamma_flow > 0.0 {
+        a.push("--min-snr-gamma".into());
+        a.push(cfg.min_snr_gamma_flow.to_string());
+    }
+    if cfg.caption_dropout > 0.0 {
+        a.push("--caption-dropout-probability".into());
+        a.push(cfg.caption_dropout.to_string());
+    }
+    Ok(a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -750,6 +800,21 @@ mod tests {
         assert!((s.grad_norm - 0.0076).abs() < 1e-6, "grad={}", s.grad_norm);
         assert!((s.speed_s_step - 5.3).abs() < 1e-6, "speed={}", s.speed_s_step);
         assert_eq!(s.eta_secs, 10);
+    }
+
+    #[test]
+    fn parses_real_train_sd35_run_line() {
+        // Captured verbatim from a real `target/release/train_sd35` run
+        // (3-step smoke on an 8-sample 1024px cache, 2026-06-19). Tag has a dot.
+        let line = "[SD3.5-lora] step 1/3 | epoch 1/1 | loss 0.7028 | grad_norm 0.0108 | 4.6s/step | elapsed 0:00:04 | ETA 0:00:09";
+        let mut s = LiveStats::default();
+        assert!(parse_progress_line(line, &mut s));
+        assert_eq!(s.step, 1);
+        assert_eq!(s.total_steps, 3);
+        assert!((s.loss - 0.7028).abs() < 1e-6, "loss={}", s.loss);
+        assert!((s.grad_norm - 0.0108).abs() < 1e-6, "grad={}", s.grad_norm);
+        assert!((s.speed_s_step - 4.6).abs() < 1e-6, "speed={}", s.speed_s_step);
+        assert_eq!(s.eta_secs, 9);
     }
 
     #[test]
@@ -958,6 +1023,36 @@ mod tests {
         cfg.model_type = "chroma".into();
         cfg.cache_dir = "/cache/chroma".into();
         assert!(chroma_args(&cfg).is_err());
+    }
+
+    #[test]
+    fn sd35_args_uses_transformer_and_requires_config() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "sd35".into();
+        cfg.cache_dir = "/cache/sd35".into();
+        cfg.base_model_path = "/models/sd3.5_medium.safetensors".into();
+        cfg.max_train_steps = 150.0;
+        // No run_config_path -> fail loud (sd35 --config is required).
+        assert!(sd35_args(&cfg).is_err());
+        cfg.run_config_path = "/cfg/sd35_smoke.json".into();
+        let joined = sd35_args(&cfg).expect("sd35 args ok").join(" ");
+        assert!(joined.contains("--transformer /models/sd3.5_medium.safetensors"), "{joined}");
+        assert!(joined.contains("--config /cfg/sd35_smoke.json"), "{joined}");
+        assert!(joined.contains("--batch-size"), "sd35 has --batch-size: {joined}");
+        assert!(joined.contains("--warmup-steps"), "sd35 has --warmup-steps: {joined}");
+        assert!(!joined.contains("--unet"), "{joined}");
+        assert!(!joined.contains("--offload"), "train_sd35 has no --offload: {joined}");
+    }
+
+    #[test]
+    fn sd35_preset_sets_full_recipe_not_failloud() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type_index = 3; // STABLE_DIFFUSION_35
+        cfg.apply_model_preset(true);
+        assert_eq!(cfg.model_type, "sd35");
+        assert!(!cfg.base_model_path.is_empty(), "sd35 preset must set the checkpoint path");
+        assert!(!cfg.cache_dir.is_empty(), "sd35 preset must set a cache dir");
+        assert!((cfg.timestep_shift - 3.0).abs() < 1e-6);
     }
 
     #[test]

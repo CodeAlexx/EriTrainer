@@ -669,6 +669,12 @@ const SERENITY_L2P_CHECKPOINT: &str =
 const SERENITY_L2P_CACHE: &str = "/home/alex/EriDiffusion/EriDiffusion-v2/cache/boxjana_l2p_512";
 const SERENITY_HIDREAM_CHECKPOINT: &str = "/home/alex/HiDream-O1-Image-Dev-weights";
 const SERENITY_HIDREAM_STAGE: &str = "/home/alex/trainings/ideogram4_giger_stage";
+// SD3.5: default to the medium checkpoint (5GB, fits 24GB without offload —
+// train_sd35 has no --offload). sd3.5_large.safetensors (16GB) is also present.
+const SERENITY_SD35_CHECKPOINT: &str =
+    "/home/alex/.serenity/models/checkpoints/sd3.5_medium.safetensors";
+const SERENITY_SD35_CACHE: &str =
+    "/home/alex/EriDiffusion/EriDiffusion-v2/cache/eri2_sd35_512_smoke";
 const SERENITY_WAN22_CHECKPOINT: &str =
     "/home/alex/.serenity/models/checkpoints/wan2.2_t2v_low_noise_14b_fp16.safetensors";
 
@@ -730,12 +736,20 @@ impl TrainConfig {
             match arch_index_for_model_type(self.model_type_index) {
                 Some(a) => arch = a,
                 None => {
-                    // STABLE_DIFFUSION_35 has no trainable runner (blocked
-                    // refs). Route to an unwired backend so launch fails
-                    // loudly instead of silently training the prior model.
+                    // STABLE_DIFFUSION_35 (model-type-only; no Architecture-combo
+                    // entry). EDv2 has train_sd35, so apply the full SD3.5 recipe.
                     self.backend_target = String::from("sd35");
                     self.model_type = String::from("sd35");
+                    self.model_type_index = 3;
+                    self.base_model_path = String::from(SERENITY_SD35_CHECKPOINT);
+                    self.cache_dir = String::from(SERENITY_SD35_CACHE);
                     self.model_arch = String::from("sd35");
+                    self.sample_sampler = String::from("FlowMatch Euler");
+                    self.sampler_preset = String::from("SD35_20");
+                    self.learning_rate = 0.0001;
+                    self.lora_rank = 16.0;
+                    self.lora_alpha = 16.0;
+                    self.timestep_shift = 3.0;
                     return;
                 }
             }
@@ -1055,12 +1069,16 @@ mod preset_tests {
     }
 
     #[test]
-    fn sd35_routes_to_fail_loud_unwired_backend() {
+    fn sd35_resolves_to_sd35_backend_with_recipe() {
+        // SD3.5 has no Architecture-combo entry (model-type-only). EDv2 has
+        // train_sd35, so selecting it applies the full SD3.5 recipe (was
+        // fail-loud while the Mojo had no SD3.5 trainer).
         let mut cfg = TrainConfig::default();
-        cfg.model_type_index = 3; // STABLE_DIFFUSION_35: no trainable runner
+        cfg.model_type_index = 3; // STABLE_DIFFUSION_35
         cfg.apply_model_preset(true);
         assert_eq!(cfg.model_type, "sd35");
         assert_eq!(cfg.backend_target, "sd35");
+        assert!(!cfg.base_model_path.is_empty());
     }
 
     #[test]
