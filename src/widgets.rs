@@ -117,3 +117,29 @@ pub fn toggle_row(ui: &mut egui::Ui, label: &str, value: &mut bool, on_text: &st
         ui.checkbox(value, on_text);
     });
 }
+
+/// Editable path row with a native "Browse…" button. `folder = true` opens a
+/// folder picker, else a file picker. The dialog is native (rfd); it starts in
+/// the current value's directory when set.
+pub fn browse_row(ui: &mut egui::Ui, label: &str, value: &mut String, folder: bool) {
+    ui.horizontal(|ui| {
+        ui.add_sized([LABEL_W, ui.spacing().interact_size.y], egui::Label::new(label));
+        ui.text_edit_singleline(value);
+        let hint = if folder { "Pick folder" } else { "Pick file" };
+        if ui.button("📁").on_hover_text(hint).clicked() {
+            let mut dlg = rfd::FileDialog::new();
+            let cur = value.trim();
+            if !cur.is_empty() {
+                let p = std::path::Path::new(cur);
+                let start = if p.is_dir() { Some(p) } else { p.parent() };
+                if let Some(dir) = start {
+                    dlg = dlg.set_directory(dir);
+                }
+            }
+            let picked = if folder { dlg.pick_folder() } else { dlg.pick_file() };
+            if let Some(path) = picked {
+                *value = path.to_string_lossy().into_owned();
+            }
+        }
+    });
+}

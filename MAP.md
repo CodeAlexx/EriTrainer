@@ -19,7 +19,7 @@ toolchain (eframe + serde only). Run: `cargo run`; test: `cargo test`.
 | `main.rs` | eframe `App`, 3-column shell (left `SidePanel` nav / center `TopBottomPanel` topbar + `CentralPanel` tabs / right `SidePanel` rail), per-frame `rt.tick()` + repaint cadence. | backbone |
 | `runtime.rs` | `Runtime`, `LiveStats`, `parse_progress_line` (the monitor contract), `build_command` + per-model `*_args`, `launch_env`, `resolve_launcher`, `start`/`stop`/`tick` (spawn + stdout/stderr tail thread → mpsc → parse). | backbone |
 | `config.rs` | `TrainConfig` (full OneTrainer field set), `Section` (12 nav entries), `apply_model_preset` + `arch_index_for_model_type`/`model_type_for_arch_index`, the lever machinery (`ignored_lever_summary`/`active_lever_keys`/`supported_lever_keys`), `validate`, `SERENITY_*` path consts. | surface |
-| `widgets.rs` | Form-row helpers: `form_panel`, `field_row`, `edit_row`, `slider_row`, `drag_row`, `combo_row`, `combo_str_row`, `toggle_row`. | surface |
+| `widgets.rs` | Form-row helpers: `form_panel`, `field_row`, `edit_row`, `browse_row` (native file/folder picker via rfd), `slider_row`, `drag_row`, `combo_row`, `combo_str_row`, `toggle_row`. | surface |
 | `theme.rs`, `shell.rs`, `nav.rs`, `topbar.rs`, `rail.rs`, `sysmetrics.rs` | Chrome: serenity dark theme, 3-col metrics, left nav, top action bar (Start/Stop + validation/capability banner), live-status rail, nvidia-smi/`/proc` metrics. | chrome |
 | `tabs/mod.rs` + `tabs/*.rs` | Per-section panels (general, model, training, dataset, sampling, lora, captioner, concepts, backup, cloud, runs, logs). | surface |
 

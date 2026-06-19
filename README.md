@@ -63,8 +63,10 @@ and the schedule on **Training**, then **Start training**.
   when you haven't supplied a Run Config path.
 - **Config save/load**: the General tab can save the current run config to
   `~/.config/eritrainer/configs/<run_name>.json` and reload any saved config.
-- Remaining: the deferred/video models (flux, qwen, wan22, ltx2, …); file/folder
-  pickers (native dialogs); a polished live-GUI pass.
+- **File/folder pickers**: path fields (Base Model, Run Config, Cache, Workspace,
+  Destination, Dataset, Sample Dir) have a native "Browse…" button (rfd).
+- Remaining: the deferred/video models (flux, qwen, wan22, ltx2, …); a polished
+  live-GUI pass.
 
 See `MAP.md` for the code map + add-a-model recipe and `ERITRAINER_PLAN.md` for the
 full build spec.

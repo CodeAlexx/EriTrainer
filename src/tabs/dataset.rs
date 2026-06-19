@@ -7,13 +7,13 @@
 use eframe::egui;
 
 use crate::config::{resolution_options, TrainConfig};
-use crate::widgets::{combo_str_row, edit_row, field_row, form_panel, slider_row, toggle_row};
+use crate::widgets::{browse_row, combo_str_row, field_row, form_panel, slider_row, toggle_row};
 
 pub fn render(ui: &mut egui::Ui, cfg: &mut TrainConfig) {
     let resolution_opts = resolution_options();
 
     form_panel(ui, "DATASET", "Image path, concept file, and cache policy", |ui| {
-        edit_row(ui, "Dataset Path", &mut cfg.dataset_path);
+        browse_row(ui, "Dataset Path", &mut cfg.dataset_path, true);
         field_row(ui, "Concept File", &cfg.concept_file_name);
         combo_str_row(ui, "ds_resolution", "Resolution", &resolution_opts, &mut cfg.resolution);
         // No runner consumes this toggle — bucketing is baked into the cache.

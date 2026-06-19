@@ -10,7 +10,7 @@ use crate::config::{
     architecture_options, model_type_options, output_format_options, precision_options,
     training_method_options, TrainConfig,
 };
-use crate::widgets::{combo_row, combo_str_row, edit_row, field_row, form_panel, toggle_row};
+use crate::widgets::{browse_row, combo_row, combo_str_row, field_row, form_panel, toggle_row};
 
 pub fn render(ui: &mut egui::Ui, cfg: &mut TrainConfig) {
     let method_opts = training_method_options();
@@ -32,17 +32,17 @@ pub fn render(ui: &mut egui::Ui, cfg: &mut TrainConfig) {
         if model_changed || arch_changed {
             cfg.apply_model_preset(model_changed);
         }
-        edit_row(ui, "Base Model", &mut cfg.base_model_path);
+        browse_row(ui, "Base Model", &mut cfg.base_model_path, false);
         // Path to the EDv2 trainer --config JSON (dataset/recipe). Required to
         // launch; e.g. EriDiffusion-v2/configs/klein9b_alina.json.
-        edit_row(ui, "Run Config", &mut cfg.run_config_path);
+        browse_row(ui, "Run Config", &mut cfg.run_config_path, false);
         field_row(ui, "VAE", &cfg.vae_override);
         toggle_row(ui, "Transformer", &mut cfg.train_transformer, "Train transformer");
         toggle_row(ui, "Text Encoder", &mut cfg.train_text_encoder, "Train text encoder");
     });
 
     form_panel(ui, "OUTPUT", "Destination, format, and backend", |ui| {
-        edit_row(ui, "Destination", &mut cfg.output_dir);
+        browse_row(ui, "Destination", &mut cfg.output_dir, true);
         combo_str_row(ui, "model_output_format", "Format", &format_opts, &mut cfg.output_model_format);
         combo_str_row(ui, "model_output_dtype", "Output DType", &precision_opts, &mut cfg.output_dtype);
         field_row(ui, "Backend", &cfg.backend_target);

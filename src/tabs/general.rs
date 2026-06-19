@@ -6,7 +6,7 @@ use eframe::egui;
 use crate::config::{
     configs_dir, device_options, list_saved_configs, precision_options, TrainConfig,
 };
-use crate::widgets::{combo_str_row, drag_row, edit_row, field_row, form_panel, toggle_row};
+use crate::widgets::{browse_row, combo_str_row, drag_row, field_row, form_panel, toggle_row};
 
 pub fn render(ui: &mut egui::Ui, cfg: &mut TrainConfig) {
     form_panel(ui, "CONFIG", "Save / load this run configuration", |ui| {
@@ -54,8 +54,8 @@ pub fn render(ui: &mut egui::Ui, cfg: &mut TrainConfig) {
     });
 
     form_panel(ui, "WORKSPACE", "Paths, cache policy, and safety", |ui| {
-        edit_row(ui, "Workspace", &mut cfg.workspace_dir);
-        edit_row(ui, "Cache", &mut cfg.cache_dir);
+        browse_row(ui, "Workspace", &mut cfg.workspace_dir, true);
+        browse_row(ui, "Cache", &mut cfg.cache_dir, true);
         toggle_row(ui, "Continue Backup", &mut cfg.continue_last_backup, "Continue from last backup");
         toggle_row(ui, "Only Cache", &mut cfg.only_cache, "Only cache");
         toggle_row(ui, "Overwrite", &mut cfg.prevent_overwrites, "Prevent overwrites");

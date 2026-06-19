@@ -4,13 +4,13 @@
 use eframe::egui;
 
 use crate::config::{sample_sampler_options, TrainConfig};
-use crate::widgets::{combo_str_row, drag_row, edit_row, field_row, form_panel, toggle_row};
+use crate::widgets::{browse_row, combo_str_row, drag_row, edit_row, field_row, form_panel, toggle_row};
 
 pub fn render(ui: &mut egui::Ui, cfg: &mut TrainConfig) {
     let sampler_opts = sample_sampler_options();
 
     form_panel(ui, "SAMPLING SETTINGS", "Serenity sampling cadence and sampler", |ui| {
-        edit_row(ui, "Sample Dir", &mut cfg.sample_output_dir);
+        browse_row(ui, "Sample Dir", &mut cfg.sample_output_dir, true);
         drag_row(ui, "Sample After", &mut cfg.sample_after, 10.0);
         drag_row(ui, "Skip First", &mut cfg.sample_skip_first, 1.0);
         drag_row(ui, "Steps", &mut cfg.sample_steps, 1.0);

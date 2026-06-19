@@ -19,6 +19,9 @@ egui = "=0.31.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+# Native file/folder dialogs. xdg-portal + async-std backend (no GTK system
+# dependency); resolves offline from the local cargo cache.
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
 
 # NOTE: EriTrainer deliberately does NOT depend on eridiffusion-core. It is a
 # launcher UI — it writes a runner config JSON and spawns the existing EDv2
