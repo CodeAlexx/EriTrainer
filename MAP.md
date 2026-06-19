@@ -32,7 +32,9 @@ disjoint files; see `ERITRAINER_PLAN.md`).
 
 ```
 TopBar "Start" → Runtime::start(cfg)
-  → build_command(cfg)              # dispatch on cfg.model_type → (program, args)
+  → (if needs_generated_config(model_type) && Run Config empty)
+      write_runner_config(cfg)      # emit EDv2 TrainConfig JSON from the form → set --config
+  → build_command(eff)              # dispatch on cfg.model_type → (program, args)
       → <model>_args(cfg)           # per-model clap-flag mapping; fail-loud on missing paths
       → resolve_launcher(bin)       # prebuilt target/{release,debug}/<bin>, else `cargo run`
   → Command + launch_env(cfg)       # libtorch on LD_LIBRARY_PATH, RUST_LOG, klein FLAME flags
@@ -67,8 +69,15 @@ binary's `Args` before wiring. Current mapping (`build_command`):
 | hidream | **train_hidream_o1** | `--model-path` (dir) | optional | no | no | name reconciliation |
 | sd35 | train_sd35 | `--transformer` (file) | required | yes | no | 3 encoders; prep 1024-only |
 
+Also wired: **l2p** (`train_l2p`, `--model`/`--cache`/`--output`/`--lora-rank`/
+`--train-shift`, grad-checkpoint on by default for the ~19.5GB pixel checkpoint).
 Deferred (not wired): flux-1-dev, qwenimage/qwen-edit, big models; wan22, ltx2,
-acestep, l2p, u1, asymflow, slider_klein.
+acestep, u1, asymflow, slider_klein.
+
+**Runner `--config` generation**: models requiring `--config` (klein/ernie/anima/
+sd35, see `needs_generated_config`) auto-write an EDv2-schema `TrainConfig` JSON
+from the form (`write_runner_config` → `RunnerConfig`, mirrors the example configs)
+when Run Config is empty. A user-set Run Config path is left untouched.
 
 ## 5. Where to start — add a model
 

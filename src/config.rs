@@ -883,6 +883,9 @@ impl TrainConfig {
                 self.lora_rank = 16.0;
                 self.lora_alpha = 16.0;
                 self.timestep_shift = 3.0;
+                // ~19.5GB pixel-space checkpoint: grad checkpointing on by
+                // default so the default launch fits a 24GB card.
+                self.gradient_checkpointing = true;
             }
             9 => {
                 // LTX-2 AV — NO production trainer yet. Routed to an unwired

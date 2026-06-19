@@ -53,12 +53,16 @@ and the schedule on **Training**, then **Start training**.
 ## Status
 
 - Shell, tabs, config model, live rail, and system metrics: built.
-- **Klein** launch path wired and verified end-to-end against the real `train_klein`
-  binary (a short smoke run produced decreasing loss and a LoRA checkpoint).
-- **SDXL** launch path wired (`--unet`, optional `--config`, no `--batch-size`/`--offload`)
-  and verified against the real `train_sdxl` binary (accepts the generated argv and
-  reaches the cache stage).
-- Remaining: wire the other models' launch arguments (each `train_*` has its own CLI),
-  and a polished live-GUI pass.
+- **9 models** wired and verified end-to-end against their real binaries (each: a
+  short smoke run produced finite/decreasing loss + a LoRA checkpoint, and the
+  trainer's progress line is covered by a parser test): klein, sdxl, zimage,
+  chroma, ernie, anima, hidream-o1, sd35, l2p. Each `train_*` has its own CLI —
+  see the per-model table in `MAP.md`.
+- **Runner `--config` generation**: models whose trainer requires `--config`
+  (klein/ernie/anima/sd35) auto-write an EDv2 `TrainConfig` JSON from the form
+  when you haven't supplied a Run Config path.
+- Remaining: the deferred/video models (flux, qwen, wan22, ltx2, …); file/folder
+  pickers; config save/load; a polished live-GUI pass.
 
-See `ERITRAINER_PLAN.md` for the full build spec.
+See `MAP.md` for the code map + add-a-model recipe and `ERITRAINER_PLAN.md` for the
+full build spec.

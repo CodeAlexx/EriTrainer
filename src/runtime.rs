@@ -17,6 +17,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 
+use serde::Serialize;
+
 use crate::config::TrainConfig;
 
 #[derive(Clone, Default)]
@@ -78,7 +80,27 @@ impl Runtime {
         self.backend_label = cfg.model_type.clone();
         self.progress_source = String::from("waiting");
 
-        let (program, args) = match build_command(cfg) {
+        // For models whose trainer REQUIRES --config, auto-generate the EDv2
+        // TrainConfig JSON from the UI fields when the user hasn't supplied one,
+        // so a run launches from the form (mirrors the Mojo
+        // `_write_runner_train_config`). A user-set Run Config is left untouched.
+        let mut eff = cfg.clone();
+        if needs_generated_config(&eff.model_type) && eff.run_config_path.trim().is_empty() {
+            match write_runner_config(&eff) {
+                Ok(path) => {
+                    self.push_log(format!("wrote runner config {path}"));
+                    eff.run_config_path = path;
+                }
+                Err(e) => {
+                    self.has_running = false;
+                    self.status_text = format!("config gen failed: {e}");
+                    self.push_log(format!("CONFIG GEN FAILED: {e}"));
+                    return;
+                }
+            }
+        }
+
+        let (program, args) = match build_command(&eff) {
             Ok(pa) => pa,
             Err(e) => {
                 self.has_running = false;
@@ -269,7 +291,89 @@ fn parse_hms(s: &str) -> u64 {
     secs
 }
 
-// --- Launch command construction (M1: Klein wired; others fail loud) ---
+// --- Runner --config generation (write the EDv2 TrainConfig JSON from the UI) ---
+
+/// EDv2 `TrainConfig` schema (subset) emitted as the trainer `--config` JSON.
+/// Mirrors the working example configs (e.g. `configs/klein9b_alina.json`) — the
+/// load-bearing fields EDv2's `from_json_path` reads; extras are tolerated.
+#[derive(Serialize)]
+struct RunnerConfig {
+    base_model_name: String,
+    training_method: String,
+    peft_type: String,
+    lora_rank: u64,
+    lora_alpha: f64,
+    learning_rate: f64,
+    batch_size: u64,
+    epochs: u64,
+    timestep_distribution: String,
+    timestep_shift: f32,
+    min_noising_strength: f32,
+    max_noising_strength: f32,
+    mse_strength: f32,
+    mae_strength: f32,
+    loss_weight_fn: String,
+    clip_grad_norm: f32,
+}
+
+impl RunnerConfig {
+    fn from_ui(cfg: &TrainConfig) -> Self {
+        let or = |s: &str, d: &str| {
+            if s.trim().is_empty() {
+                d.to_string()
+            } else {
+                s.to_string()
+            }
+        };
+        RunnerConfig {
+            base_model_name: cfg.base_model_path.clone(),
+            training_method: String::from("LORA"),
+            peft_type: or(&cfg.peft_type, "LORA"),
+            lora_rank: cfg.lora_rank.max(1.0) as u64,
+            lora_alpha: cfg.lora_alpha as f64,
+            learning_rate: cfg.learning_rate as f64,
+            batch_size: cfg.batch_size.max(1.0) as u64,
+            epochs: cfg.epochs.max(1.0) as u64,
+            timestep_distribution: or(&cfg.timestep_distribution, "LOGIT_NORMAL"),
+            timestep_shift: cfg.timestep_shift,
+            min_noising_strength: cfg.min_noising_strength,
+            max_noising_strength: cfg.max_noising_strength,
+            mse_strength: cfg.mse_strength,
+            mae_strength: cfg.mae_strength,
+            loss_weight_fn: or(&cfg.loss_weight_fn, "CONSTANT"),
+            clip_grad_norm: cfg.clip_grad_norm,
+        }
+    }
+}
+
+/// Serialize the runner `--config` JSON from the UI fields.
+pub fn runner_config_json(cfg: &TrainConfig) -> String {
+    serde_json::to_string_pretty(&RunnerConfig::from_ui(cfg))
+        .unwrap_or_else(|_| String::from("{}"))
+}
+
+/// Which models' trainers REQUIRE `--config` — EriTrainer auto-generates one
+/// from the form when the user hasn't supplied a Run Config path.
+fn needs_generated_config(model_type: &str) -> bool {
+    matches!(model_type, "klein" | "ernie" | "anima" | "sd35")
+}
+
+/// Write the generated runner config to disk; return its path. Lands in the
+/// output dir (or the temp dir if unset) as `eritrainer_run_config.json`.
+fn write_runner_config(cfg: &TrainConfig) -> Result<String, String> {
+    let dir = if cfg.output_dir.trim().is_empty() {
+        std::env::temp_dir()
+    } else {
+        PathBuf::from(&cfg.output_dir)
+    };
+    std::fs::create_dir_all(&dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    let path = dir.join("eritrainer_run_config.json");
+    std::fs::write(&path, runner_config_json(cfg))
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path.to_string_lossy().into_owned())
+}
+
+// --- Launch command construction ---
 
 /// EDv2 workspace dir; override with `ERITRAINER_EDV2_DIR`.
 fn edv2_dir() -> PathBuf {
@@ -351,9 +455,10 @@ pub fn build_command(cfg: &TrainConfig) -> Result<(String, Vec<String>), String>
         // model_type "hidream" -> bin train_hidream_o1 (name reconciliation).
         "hidream" => ("train_hidream_o1", hidream_args(cfg)?),
         "sd35" => ("train_sd35", sd35_args(cfg)?),
+        "l2p" => ("train_l2p", l2p_args(cfg)?),
         other => {
             return Err(format!(
-                "launch for model '{other}' is not wired yet (wired: klein, sdxl, zimage, chroma, ernie, anima, hidream, sd35)"
+                "launch for model '{other}' is not wired yet (wired: klein, sdxl, zimage, chroma, ernie, anima, hidream, sd35, l2p)"
             ))
         }
     };
@@ -734,6 +839,51 @@ fn sd35_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
     Ok(a)
 }
 
+/// Z-Image L2P (pixel-space) argv mirroring `train_l2p.rs` clap flags. UNUSUAL
+/// flag names: `--model` (checkpoint), `--cache` (NOT --cache-dir), `--output`
+/// (NOT --output-dir, REQUIRED), `--lora-rank` (NOT --rank), `--train-shift`
+/// (the trainer is compiled for a fixed shift and fails loud on a mismatch).
+/// `--config` optional; NO --batch-size/--warmup-steps/--offload/--min-snr-gamma.
+fn l2p_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    if cfg.base_model_path.trim().is_empty() {
+        return Err(String::from("base model path (--model) is required"));
+    }
+    if cfg.cache_dir.trim().is_empty() {
+        return Err(String::from("cache dir (--cache) is required"));
+    }
+    if cfg.output_dir.trim().is_empty() {
+        return Err(String::from("output dir (--output) is required (l2p has no default)"));
+    }
+    let mut a: Vec<String> = vec![
+        "--model".into(),
+        cfg.base_model_path.clone(),
+        "--cache".into(),
+        cfg.cache_dir.clone(),
+        "--output".into(),
+        cfg.output_dir.clone(),
+        "--steps".into(),
+        (cfg.max_train_steps.max(1.0) as u64).to_string(),
+        "--lr".into(),
+        cfg.learning_rate.to_string(),
+        "--lora-rank".into(),
+        (cfg.lora_rank.max(1.0) as u64).to_string(),
+        "--lora-alpha".into(),
+        cfg.lora_alpha.to_string(),
+        "--train-shift".into(),
+        cfg.timestep_shift.to_string(),
+    ];
+    // The L2P checkpoint is ~19.5GB; grad checkpointing is needed to fit a 24GB
+    // card. The preset enables it by default; the UI toggle maps here.
+    if cfg.gradient_checkpointing {
+        a.push("--grad-checkpoint".into());
+    }
+    if !cfg.run_config_path.trim().is_empty() {
+        a.push("--config".into());
+        a.push(cfg.run_config_path.clone());
+    }
+    Ok(a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,6 +950,20 @@ mod tests {
         assert!((s.grad_norm - 0.0076).abs() < 1e-6, "grad={}", s.grad_norm);
         assert!((s.speed_s_step - 5.3).abs() < 1e-6, "speed={}", s.speed_s_step);
         assert_eq!(s.eta_secs, 10);
+    }
+
+    #[test]
+    fn parses_real_train_l2p_run_line() {
+        // Captured verbatim from a real `target/release/train_l2p` run
+        // (3-step smoke on an 8-sample 512px pixel cache, 2026-06-19).
+        let line = "[L2P-lora] step 1/3 | epoch 1/1 | loss 0.0145 | grad_norm 0.0009 | 6.0s/step | elapsed 0:00:06 | ETA 0:00:12";
+        let mut s = LiveStats::default();
+        assert!(parse_progress_line(line, &mut s));
+        assert_eq!(s.step, 1);
+        assert_eq!(s.total_steps, 3);
+        assert!((s.loss - 0.0145).abs() < 1e-6, "loss={}", s.loss);
+        assert!((s.speed_s_step - 6.0).abs() < 1e-6, "speed={}", s.speed_s_step);
+        assert_eq!(s.eta_secs, 12);
     }
 
     #[test]
@@ -1023,6 +1187,82 @@ mod tests {
         cfg.model_type = "chroma".into();
         cfg.cache_dir = "/cache/chroma".into();
         assert!(chroma_args(&cfg).is_err());
+    }
+
+    #[test]
+    fn runner_config_json_carries_ui_fields() {
+        let mut cfg = TrainConfig::default();
+        cfg.architecture_index = 1;
+        cfg.apply_model_preset(false); // klein
+        cfg.base_model_path = "/models/klein.safetensors".into();
+        cfg.lora_rank = 16.0;
+        cfg.learning_rate = 3e-5;
+        let v: serde_json::Value =
+            serde_json::from_str(&runner_config_json(&cfg)).expect("valid json");
+        assert_eq!(v["base_model_name"], "/models/klein.safetensors");
+        assert_eq!(v["training_method"], "LORA");
+        assert_eq!(v["lora_rank"], 16);
+        assert!((v["learning_rate"].as_f64().unwrap() - 3e-5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn needs_generated_config_matches_required_set() {
+        for m in ["klein", "ernie", "anima", "sd35"] {
+            assert!(needs_generated_config(m), "{m} should require generated config");
+        }
+        for m in ["sdxl", "zimage", "chroma", "hidream"] {
+            assert!(!needs_generated_config(m), "{m} should not");
+        }
+    }
+
+    #[test]
+    fn write_runner_config_writes_parseable_file() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "klein".into();
+        cfg.base_model_path = "/models/k.safetensors".into();
+        cfg.output_dir = std::env::temp_dir()
+            .join("eritrainer_test_runcfg")
+            .to_string_lossy()
+            .into_owned();
+        let path = write_runner_config(&cfg).expect("write ok");
+        let text = std::fs::read_to_string(&path).expect("read back");
+        let v: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        assert_eq!(v["base_model_name"], "/models/k.safetensors");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn l2p_args_uses_unusual_flag_names() {
+        let mut cfg = TrainConfig::default();
+        cfg.architecture_index = 8;
+        cfg.apply_model_preset(false); // l2p
+        cfg.cache_dir = "/cache/l2p".into();
+        cfg.base_model_path = "/models/l2p.safetensors".into();
+        cfg.output_dir = "/out/l2p".into();
+        cfg.max_train_steps = 100.0;
+        let joined = l2p_args(&cfg).expect("l2p args ok").join(" ");
+        assert!(joined.contains("--model /models/l2p.safetensors"), "{joined}");
+        assert!(joined.contains("--cache /cache/l2p"), "{joined}");
+        assert!(joined.contains("--output /out/l2p"), "{joined}");
+        assert!(joined.contains("--lora-rank"), "l2p uses --lora-rank: {joined}");
+        assert!(joined.contains("--train-shift"), "{joined}");
+        // The negative space: l2p must NOT emit these (clap would reject).
+        assert!(!joined.contains("--cache-dir"), "l2p uses --cache not --cache-dir: {joined}");
+        assert!(!joined.contains("--output-dir"), "l2p uses --output not --output-dir: {joined}");
+        assert!(!joined.contains("--rank "), "l2p uses --lora-rank not --rank: {joined}");
+        assert!(!joined.contains("--batch-size"), "{joined}");
+        assert!(!joined.contains("--offload"), "{joined}");
+    }
+
+    #[test]
+    fn l2p_args_fails_loud_on_missing_output() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "l2p".into();
+        cfg.cache_dir = "/cache/l2p".into();
+        cfg.base_model_path = "/models/l2p.safetensors".into();
+        cfg.output_dir = String::new(); // clear the non-empty default
+        // l2p --output is required (no clap default) -> fail loud when empty.
+        assert!(l2p_args(&cfg).is_err());
     }
 
     #[test]

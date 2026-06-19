@@ -25,6 +25,10 @@ Run `cargo run`; test `cargo test` (offline-buildable: eframe 0.31 is cached).
 - **Chrome**: `theme/shell/nav/topbar/rail/sysmetrics`.
 - **Monitor contract**: the one stdout line every EDv2 trainer prints via
   `eridiffusion-core::training::progress::log_step_with_resume` — see MAP §3.
+- **Runner `--config` generation**: `runtime.rs::write_runner_config` emits an
+  EDv2 `TrainConfig` JSON from the form for models in `needs_generated_config`
+  (klein/ernie/anima/sd35) when Run Config is empty. Keep `RunnerConfig`'s field
+  set aligned with EDv2's loader (mirror the working `configs/*.json`).
 
 ## Hard rules
 
