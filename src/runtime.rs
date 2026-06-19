@@ -348,9 +348,11 @@ pub fn build_command(cfg: &TrainConfig) -> Result<(String, Vec<String>), String>
         "chroma" => ("train_chroma", chroma_args(cfg)?),
         "ernie" => ("train_ernie", ernie_args(cfg)?),
         "anima" => ("train_anima", anima_args(cfg)?),
+        // model_type "hidream" -> bin train_hidream_o1 (name reconciliation).
+        "hidream" => ("train_hidream_o1", hidream_args(cfg)?),
         other => {
             return Err(format!(
-                "launch for model '{other}' is not wired yet (wired: klein, sdxl, zimage, chroma, ernie, anima)"
+                "launch for model '{other}' is not wired yet (wired: klein, sdxl, zimage, chroma, ernie, anima, hidream)"
             ))
         }
     };
@@ -642,6 +644,46 @@ fn anima_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
     Ok(a)
 }
 
+/// HiDream-O1 argv mirroring `train_hidream_o1.rs` clap flags. Checkpoint flag
+/// is `--model-path` (the full model dir); `--config` OPTIONAL. Has NO
+/// `--warmup-steps`, NO `--min-snr-gamma`, NO `--batch-size`, NO `--offload`
+/// (passing any would make clap reject). Model_type "hidream" maps to the bin
+/// `train_hidream_o1`.
+fn hidream_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    if cfg.cache_dir.trim().is_empty() {
+        return Err(String::from("cache dir (--cache-dir) is required"));
+    }
+    if cfg.base_model_path.trim().is_empty() {
+        return Err(String::from("base model path (--model-path) is required"));
+    }
+    let mut a: Vec<String> = Vec::new();
+    if !cfg.run_config_path.trim().is_empty() {
+        a.push("--config".into());
+        a.push(cfg.run_config_path.clone());
+    }
+    a.push("--cache-dir".into());
+    a.push(cfg.cache_dir.clone());
+    a.push("--model-path".into());
+    a.push(cfg.base_model_path.clone());
+    a.push("--steps".into());
+    a.push((cfg.max_train_steps.max(1.0) as u64).to_string());
+    a.push("--rank".into());
+    a.push((cfg.lora_rank.max(1.0) as u64).to_string());
+    a.push("--lora-alpha".into());
+    a.push(cfg.lora_alpha.to_string());
+    a.push("--lr".into());
+    a.push(cfg.learning_rate.to_string());
+    if !cfg.output_dir.trim().is_empty() {
+        a.push("--output-dir".into());
+        a.push(cfg.output_dir.clone());
+    }
+    if cfg.caption_dropout > 0.0 {
+        a.push("--caption-dropout-probability".into());
+        a.push(cfg.caption_dropout.to_string());
+    }
+    Ok(a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -708,6 +750,21 @@ mod tests {
         assert!((s.grad_norm - 0.0076).abs() < 1e-6, "grad={}", s.grad_norm);
         assert!((s.speed_s_step - 5.3).abs() < 1e-6, "speed={}", s.speed_s_step);
         assert_eq!(s.eta_secs, 10);
+    }
+
+    #[test]
+    fn parses_real_train_hidream_o1_run_line() {
+        // Captured verbatim from a real `target/release/train_hidream_o1` run
+        // (3-step smoke on an 8-sample 512px cache, 2026-06-19).
+        let line = "[HiDreamO1-lora] step 1/3 | epoch 1/1 | loss 0.2927 | grad_norm 0.2897 | 3.5s/step | elapsed 0:00:03 | ETA 0:00:06";
+        let mut s = LiveStats::default();
+        assert!(parse_progress_line(line, &mut s));
+        assert_eq!(s.step, 1);
+        assert_eq!(s.total_steps, 3);
+        assert!((s.loss - 0.2927).abs() < 1e-6, "loss={}", s.loss);
+        assert!((s.grad_norm - 0.2897).abs() < 1e-6, "grad={}", s.grad_norm);
+        assert!((s.speed_s_step - 3.5).abs() < 1e-6, "speed={}", s.speed_s_step);
+        assert_eq!(s.eta_secs, 6);
     }
 
     #[test]
@@ -901,6 +958,37 @@ mod tests {
         cfg.model_type = "chroma".into();
         cfg.cache_dir = "/cache/chroma".into();
         assert!(chroma_args(&cfg).is_err());
+    }
+
+    #[test]
+    fn hidream_args_uses_model_path_and_omits_warmup() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "hidream".into();
+        cfg.cache_dir = "/cache/hidream".into();
+        cfg.base_model_path = "/models/HiDream-O1".into();
+        cfg.max_train_steps = 100.0;
+        let joined = hidream_args(&cfg).expect("hidream args ok").join(" ");
+        assert!(joined.contains("--model-path /models/HiDream-O1"), "{joined}");
+        assert!(joined.contains("--cache-dir /cache/hidream"), "{joined}");
+        assert!(joined.contains("--steps 100"), "{joined}");
+        assert!(!joined.contains("--warmup-steps"), "train_hidream_o1 has no --warmup-steps: {joined}");
+        assert!(!joined.contains("--min-snr-gamma"), "no --min-snr-gamma: {joined}");
+        assert!(!joined.contains("--batch-size"), "no --batch-size: {joined}");
+        assert!(!joined.contains("--transformer"), "{joined}");
+    }
+
+    #[test]
+    fn build_command_maps_hidream_to_train_hidream_o1() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "hidream".into();
+        cfg.cache_dir = "/cache/h".into();
+        cfg.base_model_path = "/models/h".into();
+        let (program, args) = build_command(&cfg).expect("ok");
+        // resolve_launcher yields EITHER the prebuilt bin path (program) OR
+        // `cargo ... --bin train_hidream_o1` (in args). Accept either.
+        let in_program = program.ends_with("train_hidream_o1");
+        let in_args = args.iter().any(|a| a == "train_hidream_o1");
+        assert!(in_program || in_args, "expected train_hidream_o1 bin: program={program} args={args:?}");
     }
 
     #[test]
