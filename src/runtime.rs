@@ -520,6 +520,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_real_train_sdxl_run_line() {
+        // Captured verbatim from a real `target/release/train_sdxl` run
+        // (3-step smoke on an 8-sample 512px cache, 2026-06-19).
+        let line = "[SDXL-lora] step 1/3 | epoch 1/1 | loss 0.1063 | grad_norm 0.0371 | 7.7s/step | elapsed 0:00:07 | ETA 0:00:15";
+        let mut s = LiveStats::default();
+        assert!(parse_progress_line(line, &mut s));
+        assert_eq!(s.step, 1);
+        assert_eq!(s.total_steps, 3);
+        assert!((s.loss - 0.1063).abs() < 1e-6, "loss={}", s.loss);
+        assert!((s.grad_norm - 0.0371).abs() < 1e-6, "grad={}", s.grad_norm);
+        assert!((s.speed_s_step - 7.7).abs() < 1e-6, "speed={}", s.speed_s_step);
+        assert_eq!(s.eta_secs, 15);
+    }
+
+    #[test]
     fn klein_args_builds_expected_flags() {
         let mut cfg = TrainConfig::default();
         cfg.architecture_index = 1;
