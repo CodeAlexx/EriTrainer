@@ -98,8 +98,11 @@ ASSETS card: VAE/Encoder/Tokenizer). Asset-flag NAMES differ per model
 l2p `--sample-qwen3` no-VAE, hidream `--sample-every` only). Emits
 `--sample-every 0` to DISABLE when off / assets missing (trainers default it on).
 **sdxl/anima** have NO in-trainer sampling (separate `sample_<m>` bin → emit
-nothing); **sd35** needs a 3-encoder set not modeled yet. Verified live: klein +
-zimage produce real sample images.
+nothing). **sd35** is a 3-encoder model: CLIP-L (generic Encoder/Tokenizer) +
+CLIP-G + T5 (+ tokenizers) are required, VAE is OPTIONAL (train_sd35 falls back
+to the main checkpoint's VAE). Verified live: klein + zimage + **sd35** produce
+real sample images — sd35 GPU smoke (sd3.5_medium + clip_l/clip_g/t5xxl_enconly,
+1024) rendered a coherent portrait, `cap=[1,154,4096] pooled=[1,2048]`.
 
 ## 5. Where to start — add a model
 
