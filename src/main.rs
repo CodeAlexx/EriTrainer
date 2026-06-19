@@ -42,6 +42,12 @@ fn main() -> eframe::Result<()> {
                     app.section = s;
                 }
             }
+            if let Ok(idx) = std::env::var("ERITRAINER_ARCH") {
+                if let Ok(i) = idx.parse::<usize>() {
+                    app.cfg.architecture_index = i;
+                    app.cfg.apply_model_preset(false);
+                }
+            }
             Ok(Box::new(app))
         }),
     )

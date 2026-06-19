@@ -110,6 +110,12 @@ pub fn model_type_options() -> Vec<String> {
         "LTX_2_VIDEO",
         "WAN_22_VIDEO",
         "HIDREAM_O1",
+        "FLUX_1_DEV",
+        "QWEN_IMAGE",
+        "ACE_STEP",
+        "SLIDER_KLEIN",
+        "ASYMFLOW",
+        "SENSENOVA_U1",
     ])
 }
 pub fn architecture_options() -> Vec<String> {
@@ -126,6 +132,12 @@ pub fn architecture_options() -> Vec<String> {
         "LTX-2 AV",
         "Wan2.2 T2V 14B",
         "HiDream O1",
+        "Flux.1 Dev",
+        "Qwen-Image",
+        "ACE-Step",
+        "Slider (Klein)",
+        "AsymFlow",
+        "SenseNova U1",
     ])
 }
 pub fn optimizer_options() -> Vec<String> {
@@ -726,6 +738,12 @@ fn arch_index_for_model_type(model_type_index: usize) -> Option<usize> {
         9 => Some(9),  // LTX_2_VIDEO
         10 => Some(10), // WAN_22_VIDEO
         11 => Some(11), // HIDREAM_O1
+        12 => Some(12), // FLUX_1_DEV
+        13 => Some(13), // QWEN_IMAGE
+        14 => Some(14), // ACE_STEP
+        15 => Some(15), // SLIDER_KLEIN
+        16 => Some(16), // ASYMFLOW
+        17 => Some(17), // SENSENOVA_U1
         _ => None,     // 3 = STABLE_DIFFUSION_35
     }
 }
@@ -745,6 +763,12 @@ fn model_type_for_arch_index(architecture_index: usize) -> Option<usize> {
         9 => Some(9),     // LTX-2 AV
         10 => Some(10),   // Wan2.2 T2V 14B
         11 => Some(11),   // HiDream O1
+        12 => Some(12),   // Flux.1 Dev
+        13 => Some(13),   // Qwen-Image
+        14 => Some(14),   // ACE-Step
+        15 => Some(15),   // Slider (Klein)
+        16 => Some(16),   // AsymFlow
+        17 => Some(17),   // SenseNova U1
         _ => None,
     }
 }
@@ -960,6 +984,58 @@ impl TrainConfig {
                 self.lora_rank = 32.0;
                 self.lora_alpha = 32.0;
                 self.timestep_shift = 3.0;
+            }
+            // --- UNVERIFIED models (wired from the CLI; not smoke-tested) ---
+            12 => {
+                self.backend_target = String::from("flux");
+                self.model_type = String::from("flux");
+                self.model_type_index = 12;
+                self.architecture_index = 12;
+                self.base_model_path = String::new();
+                self.model_arch = String::from("flux1_dev");
+            }
+            13 => {
+                self.backend_target = String::from("qwenimage");
+                self.model_type = String::from("qwenimage");
+                self.model_type_index = 13;
+                self.architecture_index = 13;
+                self.base_model_path = String::new();
+                self.model_arch = String::from("qwen_image");
+            }
+            14 => {
+                self.backend_target = String::from("acestep");
+                self.model_type = String::from("acestep");
+                self.model_type_index = 14;
+                self.architecture_index = 14;
+                self.base_model_path = String::new();
+                self.model_arch = String::from("acestep");
+            }
+            15 => {
+                // Slider (Klein) — uses the Klein 9B transformer.
+                self.backend_target = String::from("slider_klein");
+                self.model_type = String::from("slider_klein");
+                self.model_type_index = 15;
+                self.architecture_index = 15;
+                self.base_model_path = String::from(SERENITY_KLEIN9B_CHECKPOINT);
+                self.model_arch = String::from("klein9b_slider");
+            }
+            16 => {
+                // AsymFlow — Klein 9B fork (student/teacher); also needs the
+                // adapter in Aux Model (Model tab).
+                self.backend_target = String::from("asymflow");
+                self.model_type = String::from("asymflow");
+                self.model_type_index = 16;
+                self.architecture_index = 16;
+                self.base_model_path = String::from(SERENITY_KLEIN9B_CHECKPOINT);
+                self.model_arch = String::from("klein9b_asymflow");
+            }
+            17 => {
+                self.backend_target = String::from("u1");
+                self.model_type = String::from("u1");
+                self.model_type_index = 17;
+                self.architecture_index = 17;
+                self.base_model_path = String::new();
+                self.model_arch = String::from("sensenova_u1");
             }
             _ => {}
         }
@@ -1206,5 +1282,25 @@ mod preset_tests {
         cfg.apply_model_preset(false);
         let warn2 = cfg.ignored_lever_summary();
         assert!(warn2.contains("sdxl"), "warn2={warn2}");
+    }
+
+    #[test]
+    fn all_models_selectable_via_preset() {
+        assert_eq!(architecture_options().len(), 18);
+        assert_eq!(model_type_options().len(), 18);
+        let cases = [
+            (12, "flux"),
+            (13, "qwenimage"),
+            (14, "acestep"),
+            (15, "slider_klein"),
+            (16, "asymflow"),
+            (17, "u1"),
+        ];
+        for (idx, mt) in cases {
+            let mut cfg = TrainConfig::default();
+            cfg.architecture_index = idx;
+            cfg.apply_model_preset(false);
+            assert_eq!(cfg.model_type, mt, "arch index {idx} -> model_type");
+        }
     }
 }

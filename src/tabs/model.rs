@@ -36,6 +36,8 @@ pub fn render(ui: &mut egui::Ui, cfg: &mut TrainConfig) {
         // Path to the EDv2 trainer --config JSON (dataset/recipe). Required to
         // launch; e.g. EriDiffusion-v2/configs/klein9b_alina.json.
         browse_row(ui, "Run Config", &mut cfg.run_config_path, false);
+        // Secondary checkpoint: asymflow adapter / wan22 high-noise model.
+        browse_row(ui, "Aux Model", &mut cfg.aux_model_path, false);
         field_row(ui, "VAE", &cfg.vae_override);
         toggle_row(ui, "Transformer", &mut cfg.train_transformer, "Train transformer");
         toggle_row(ui, "Text Encoder", &mut cfg.train_text_encoder, "Train text encoder");
