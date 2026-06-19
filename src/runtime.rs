@@ -728,13 +728,15 @@ fn sample_flags(cfg: &TrainConfig) -> Vec<String> {
             [pair("--sample-qwen3", enc), pair("--sample-tokenizer", tok)].concat()
         }
         "sd35" => {
-            // SD3.5: VAE + CLIP-L (generic encoder/tokenizer) + CLIP-G + T5.
+            // SD3.5: CLIP-L (generic encoder/tokenizer) + CLIP-G + T5 required.
+            // VAE is OPTIONAL — train_sd35 falls back to the main checkpoint's
+            // VAE when --sample-vae is omitted (verified: cap=[1,154,4096] +
+            // checkpoint-VAE decode renders a real 1024 sample).
             let cg = cfg.sample_clip_g_path.trim();
             let cgt = cfg.sample_clip_g_tokenizer_path.trim();
             let t5 = cfg.sample_t5_path.trim();
             let t5t = cfg.sample_t5_tokenizer_path.trim();
-            if vae.is_empty()
-                || enc.is_empty()
+            if enc.is_empty()
                 || tok.is_empty()
                 || cg.is_empty()
                 || cgt.is_empty()
@@ -743,16 +745,17 @@ fn sample_flags(cfg: &TrainConfig) -> Vec<String> {
             {
                 return off;
             }
-            [
-                pair("--sample-vae", vae),
-                pair("--sample-clip-l", enc),
-                pair("--sample-clip-l-tokenizer", tok),
-                pair("--sample-clip-g", cg),
-                pair("--sample-clip-g-tokenizer", cgt),
-                pair("--sample-t5", t5),
-                pair("--sample-t5-tokenizer", t5t),
-            ]
-            .concat()
+            let mut a = Vec::new();
+            if !vae.is_empty() {
+                a.extend(pair("--sample-vae", vae));
+            }
+            a.extend(pair("--sample-clip-l", enc));
+            a.extend(pair("--sample-clip-l-tokenizer", tok));
+            a.extend(pair("--sample-clip-g", cg));
+            a.extend(pair("--sample-clip-g-tokenizer", cgt));
+            a.extend(pair("--sample-t5", t5));
+            a.extend(pair("--sample-t5-tokenizer", t5t));
+            a
         }
         _ => return off,
     };
@@ -1478,7 +1481,7 @@ mod tests {
     }
 
     #[test]
-    fn sd35_sample_flags_need_all_seven_encoders() {
+    fn sd35_sample_flags_need_encoders_vae_optional() {
         let mut cfg = TrainConfig::default();
         cfg.model_type = "sd35".into();
         cfg.sample_after = 100.0;
@@ -1487,16 +1490,15 @@ mod tests {
             negative_prompt: String::new(),
             seed: 0,
         }];
-        cfg.sample_vae_path = "/vae".into();
         cfg.sample_encoder_path = "/clipl".into();
         cfg.sample_tokenizer_path = "/clipl_tok".into();
         cfg.sample_clip_g_path = "/clipg".into();
         cfg.sample_clip_g_tokenizer_path = "/clipg_tok".into();
         cfg.sample_t5_path = "/t5".into();
         cfg.sample_t5_tokenizer_path = "/t5_tok".into();
+        // VAE omitted -> still samples (trainer falls back to the checkpoint VAE).
         let j = sample_flags(&cfg).join(" ");
         for f in [
-            "--sample-vae /vae",
             "--sample-clip-l /clipl",
             "--sample-clip-l-tokenizer /clipl_tok",
             "--sample-clip-g /clipg",
@@ -1506,7 +1508,11 @@ mod tests {
         ] {
             assert!(j.contains(f), "missing `{f}` in `{j}`");
         }
-        // Drop one encoder -> sampling disabled (fail-closed), never a partial set.
+        assert!(!j.contains("--sample-vae"), "vae must be omitted when unset: {j}");
+        // VAE set -> emitted.
+        cfg.sample_vae_path = "/vae".into();
+        assert!(sample_flags(&cfg).join(" ").contains("--sample-vae /vae"));
+        // Drop a required encoder -> sampling disabled (fail-closed).
         cfg.sample_t5_path = String::new();
         assert_eq!(
             sample_flags(&cfg),

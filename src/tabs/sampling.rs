@@ -21,7 +21,7 @@ pub fn render(ui: &mut egui::Ui, cfg: &mut TrainConfig) {
         "ernie" => (true, "In-trainer sampling: set Sample VAE + Encoder (text) + Tokenizer below."),
         "l2p" => (true, "In-trainer sampling: set Sample Encoder (Qwen3) + Tokenizer below (pixel-space, no VAE)."),
         "hidream" => (true, "In-trainer sampling: enabled by 'Sample After' alone (assets load from the model dir)."),
-        "sd35" => (true, "In-trainer sampling: set VAE + CLIP-L (Encoder/Tokenizer) + CLIP-G + T5 below (all required)."),
+        "sd35" => (true, "In-trainer sampling: set CLIP-L (Encoder/Tokenizer) + CLIP-G + T5 below (VAE optional — falls back to checkpoint)."),
         "sdxl" | "anima" => (false, "No in-trainer sampling for this model — it uses a separate sample bin."),
         _ => (false, "Unknown model."),
     };
