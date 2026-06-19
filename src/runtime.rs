@@ -344,9 +344,10 @@ pub fn build_command(cfg: &TrainConfig) -> Result<(String, Vec<String>), String>
     let (bin, args) = match cfg.model_type.as_str() {
         "klein" => ("train_klein", klein_args(cfg)?),
         "sdxl" => ("train_sdxl", sdxl_args(cfg)?),
+        "zimage" => ("train_zimage", zimage_args(cfg)?),
         other => {
             return Err(format!(
-                "launch for model '{other}' is not wired yet (wired: klein, sdxl)"
+                "launch for model '{other}' is not wired yet (wired: klein, sdxl, zimage)"
             ))
         }
     };
@@ -451,6 +452,53 @@ fn sdxl_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
     Ok(a)
 }
 
+/// Z-Image argv mirroring `train_zimage.rs` clap flags. Checkpoint flag is
+/// `--model` (a directory of DiT shards); `--config` is OPTIONAL; HAS
+/// `--batch-size` and `--warmup-steps`. Fails loud on missing `--cache-dir` /
+/// `--model`.
+fn zimage_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    if cfg.cache_dir.trim().is_empty() {
+        return Err(String::from("cache dir (--cache-dir) is required"));
+    }
+    if cfg.base_model_path.trim().is_empty() {
+        return Err(String::from("base model path (--model) is required"));
+    }
+    let mut a: Vec<String> = Vec::new();
+    if !cfg.run_config_path.trim().is_empty() {
+        a.push("--config".into());
+        a.push(cfg.run_config_path.clone());
+    }
+    a.push("--cache-dir".into());
+    a.push(cfg.cache_dir.clone());
+    a.push("--model".into());
+    a.push(cfg.base_model_path.clone());
+    a.push("--steps".into());
+    a.push((cfg.max_train_steps.max(1.0) as u64).to_string());
+    a.push("--rank".into());
+    a.push((cfg.lora_rank.max(1.0) as u64).to_string());
+    a.push("--lora-alpha".into());
+    a.push(cfg.lora_alpha.to_string());
+    a.push("--lr".into());
+    a.push(cfg.learning_rate.to_string());
+    a.push("--batch-size".into());
+    a.push((cfg.batch_size.max(1.0) as u64).to_string());
+    a.push("--warmup-steps".into());
+    a.push((cfg.learning_rate_warmup_steps.max(0.0) as u64).to_string());
+    if !cfg.output_dir.trim().is_empty() {
+        a.push("--output-dir".into());
+        a.push(cfg.output_dir.clone());
+    }
+    if cfg.min_snr_gamma_flow > 0.0 {
+        a.push("--min-snr-gamma".into());
+        a.push(cfg.min_snr_gamma_flow.to_string());
+    }
+    if cfg.caption_dropout > 0.0 {
+        a.push("--caption-dropout-probability".into());
+        a.push(cfg.caption_dropout.to_string());
+    }
+    Ok(a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,6 +565,20 @@ mod tests {
         assert!((s.grad_norm - 0.0076).abs() < 1e-6, "grad={}", s.grad_norm);
         assert!((s.speed_s_step - 5.3).abs() < 1e-6, "speed={}", s.speed_s_step);
         assert_eq!(s.eta_secs, 10);
+    }
+
+    #[test]
+    fn parses_real_train_zimage_run_line() {
+        // Captured verbatim from a real `target/release/train_zimage` run
+        // (3-step smoke on an 8-sample 512px cache, 2026-06-19).
+        let line = "[Z-Image-lora] step 1/3 | epoch 1/1 | loss 0.4745 | grad_norm 0.0001 | 4.2s/step | elapsed 0:00:04 | ETA 0:00:08";
+        let mut s = LiveStats::default();
+        assert!(parse_progress_line(line, &mut s));
+        assert_eq!(s.step, 1);
+        assert_eq!(s.total_steps, 3);
+        assert!((s.loss - 0.4745).abs() < 1e-6, "loss={}", s.loss);
+        assert!((s.speed_s_step - 4.2).abs() < 1e-6, "speed={}", s.speed_s_step);
+        assert_eq!(s.eta_secs, 8);
     }
 
     #[test]
@@ -600,5 +662,31 @@ mod tests {
         cfg.model_type = "sdxl".into();
         cfg.cache_dir = "/cache/sdxl".into();
         assert!(sdxl_args(&cfg).is_err());
+    }
+
+    #[test]
+    fn zimage_args_uses_model_flag_and_batch_size() {
+        let mut cfg = TrainConfig::default();
+        cfg.architecture_index = 7;
+        cfg.apply_model_preset(false); // zimage
+        cfg.cache_dir = "/cache/zimage".into();
+        cfg.base_model_path = "/models/zimage_base/transformer".into();
+        cfg.max_train_steps = 200.0;
+        let joined = zimage_args(&cfg).expect("zimage args ok").join(" ");
+        assert!(joined.contains("--model /models/zimage_base/transformer"), "{joined}");
+        assert!(joined.contains("--cache-dir /cache/zimage"), "{joined}");
+        assert!(joined.contains("--batch-size"), "zimage has --batch-size: {joined}");
+        assert!(joined.contains("--steps 200"), "{joined}");
+        assert!(!joined.contains("--transformer"), "zimage uses --model: {joined}");
+        assert!(!joined.contains("--unet"), "{joined}");
+        assert!(!joined.contains("--config"), "no --config when path empty: {joined}");
+    }
+
+    #[test]
+    fn zimage_args_fails_loud_on_missing_model() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "zimage".into();
+        cfg.cache_dir = "/cache/z".into();
+        assert!(zimage_args(&cfg).is_err());
     }
 }

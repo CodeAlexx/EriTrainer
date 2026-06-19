@@ -658,7 +658,11 @@ const SERENITY_ANIMA_CHECKPOINT: &str =
     "/home/alex/.serenity/models/anima/split_files/diffusion_models/anima-base-v1.0.safetensors";
 const SERENITY_ANIMA_CACHE: &str =
     "/home/alex/EriDiffusion/EriDiffusion-v2/cache/anima_synth_smoke";
-const SERENITY_ZIMAGE_CHECKPOINT: &str = "/home/alex/.serenity/models/zimage_base/transformer";
+// train_zimage --model wants a single safetensors file (mmap), NOT a sharded
+// dir — verified 2026-06-19 (the diffusers `zimage_base/transformer` dir errors
+// "Is a directory"). Point at the single-file base checkpoint.
+const SERENITY_ZIMAGE_CHECKPOINT: &str =
+    "/home/alex/.serenity/models/checkpoints/z_image_base_bf16.safetensors";
 const SERENITY_ZIMAGE_CACHE: &str = "/home/alex/mojodiffusion/output/alina_zimage_cache";
 const SERENITY_L2P_CHECKPOINT: &str =
     "/home/alex/.serenity/models/checkpoints/L2P/model-1k-merge.safetensors";
