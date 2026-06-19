@@ -30,7 +30,7 @@ pub enum Section {
 
 impl Default for Section {
     fn default() -> Self {
-        Section::General
+        Section::Model // open on Model, matching the Mojo trainer's default
     }
 }
 

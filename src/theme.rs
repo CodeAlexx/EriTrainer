@@ -1,70 +1,119 @@
-//! Dark "serenity" visuals, matching the Mojo `trainer_theme` palette: dense
-//! near-black panels, a slightly lighter window/widget fill, weak vs strong
-//! text, and a cyan accent used for the active nav row and the RUNNING pill.
+//! Theme: design-token visuals (dark default + light), Inter + JetBrains Mono
+//! fonts, the typography scale and the dense instrument-panel spacing from the
+//! Rust Trainer design handoff.
 //!
-//! The palette constants are public so nav/topbar/rail can paint accents that
-//! agree with the global `Visuals` set here.
+//! The legacy palette constants (BG/PANEL/…/ACCENT) are kept so the existing
+//! chrome (nav/topbar/rail) keeps compiling; they now source from
+//! `tokens::dark()` so the whole UI shares one palette. New widgets read
+//! `tokens::current()` directly (theme-aware).
+
+use std::sync::Arc;
 
 use eframe::egui;
 
-// --- Serenity palette (approximate; dense dark) ---
+use crate::tokens::{self, Tokens};
 
-/// App background behind the 3-column shell.
-pub const BG: egui::Color32 = egui::Color32::from_rgb(15, 17, 22);
-/// Panel fill (nav / rail / central body).
-pub const PANEL: egui::Color32 = egui::Color32::from_rgb(18, 20, 26);
-/// Window / widget fill (text edits, buttons, form panels).
-pub const WINDOW: egui::Color32 = egui::Color32::from_rgb(24, 27, 34);
-/// Slightly raised fill for hovered / active widgets.
-pub const RAISED: egui::Color32 = egui::Color32::from_rgb(31, 35, 44);
-/// Hairline separators / weak strokes.
-pub const STROKE: egui::Color32 = egui::Color32::from_rgb(44, 49, 60);
+// --- Legacy palette consts used by the chrome (nav/topbar/rail),
+//     single-sourced from the dark tokens. ---
+pub const RAISED: egui::Color32 = tokens::dark().line_2;
+pub const TEXT_STRONG: egui::Color32 = tokens::dark().ink;
+pub const TEXT_WEAK: egui::Color32 = tokens::dark().ink_dim;
+pub const ACCENT: egui::Color32 = tokens::dark().accent;
+pub const WARN: egui::Color32 = tokens::dark().warn;
+pub const IDLE: egui::Color32 = tokens::dark().ink_mute;
 
-/// Primary text.
-pub const TEXT_STRONG: egui::Color32 = egui::Color32::from_rgb(222, 226, 234);
-/// Secondary / label text.
-pub const TEXT_WEAK: egui::Color32 = egui::Color32::from_rgb(150, 157, 170);
+/// Install Inter (proportional) + JetBrains Mono (monospace). Call once.
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "inter".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/Inter-Regular.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "jbmono".to_owned(),
+        Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/JetBrainsMono-Regular.ttf"
+        ))),
+    );
+    if let Some(p) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        p.insert(0, "inter".to_owned());
+    }
+    if let Some(m) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        m.insert(0, "jbmono".to_owned());
+    }
+    ctx.set_fonts(fonts);
+}
 
-/// Cyan accent: active nav row, RUNNING pill, progress bar.
-pub const ACCENT: egui::Color32 = egui::Color32::from_rgb(56, 189, 208);
-/// Amber: PAUSED pill, capability warnings.
-pub const WARN: egui::Color32 = egui::Color32::from_rgb(228, 178, 76);
-/// Muted slate: IDLE pill.
-pub const IDLE: egui::Color32 = egui::Color32::from_rgb(108, 116, 130);
+/// The typography scale + dense spacing from the handoff.
+fn install_style(ctx: &egui::Context) {
+    use egui::{FontFamily, FontId, TextStyle};
+    let mut style = (*ctx.style()).clone();
+    style.text_styles = [
+        (TextStyle::Heading, FontId::new(14.0, FontFamily::Proportional)),
+        (TextStyle::Body, FontId::new(13.0, FontFamily::Proportional)),
+        (TextStyle::Button, FontId::new(13.0, FontFamily::Proportional)),
+        (TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace)),
+        (TextStyle::Small, FontId::new(11.0, FontFamily::Proportional)),
+    ]
+    .into();
+    // Instrument-panel density (handoff §Density).
+    style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+    style.spacing.button_padding = egui::vec2(8.0, 5.0);
+    style.spacing.interact_size.y = 28.0;
+    ctx.set_style(style);
+}
 
+/// Build `Visuals` from a token set.
+fn visuals_for(t: Tokens, light: bool) -> egui::Visuals {
+    let mut v = if light {
+        egui::Visuals::light()
+    } else {
+        egui::Visuals::dark()
+    };
+    v.panel_fill = t.bg_2;
+    v.window_fill = t.panel;
+    v.extreme_bg_color = t.bg;
+    v.faint_bg_color = t.bg_3;
+    v.override_text_color = Some(t.ink);
+    v.hyperlink_color = t.accent;
+    v.selection.bg_fill = t.accent_soft;
+    v.selection.stroke = egui::Stroke::new(1.0, t.accent);
+
+    v.widgets.noninteractive.bg_fill = t.bg_2;
+    v.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, t.line);
+    v.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, t.ink_dim);
+
+    v.widgets.inactive.bg_fill = t.bg_3;
+    v.widgets.inactive.weak_bg_fill = t.bg_3;
+    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, t.line);
+    v.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, t.ink);
+
+    v.widgets.hovered.bg_fill = t.bg_3;
+    v.widgets.hovered.weak_bg_fill = t.bg_3;
+    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, t.line_2);
+    v.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, t.ink);
+
+    v.widgets.active.bg_fill = t.accent_soft;
+    v.widgets.active.weak_bg_fill = t.accent_soft;
+    v.widgets.active.bg_stroke = egui::Stroke::new(1.0, t.accent);
+    v.widgets.active.fg_stroke = egui::Stroke::new(1.0, t.ink);
+
+    v.window_stroke = egui::Stroke::new(1.0, t.line);
+    v.window_corner_radius = egui::CornerRadius::same(6);
+    v
+}
+
+/// Full install: fonts + typography/density + dark visuals. Call once at start.
 pub fn apply(ctx: &egui::Context) {
-    let mut visuals = egui::Visuals::dark();
+    install_fonts(ctx);
+    install_style(ctx);
+    set_theme(ctx, false);
+}
 
-    visuals.panel_fill = PANEL;
-    visuals.window_fill = WINDOW;
-    visuals.extreme_bg_color = BG;
-    visuals.faint_bg_color = egui::Color32::from_rgb(21, 24, 30);
-    visuals.override_text_color = Some(TEXT_STRONG);
-    visuals.hyperlink_color = ACCENT;
-    visuals.selection.bg_fill = ACCENT.linear_multiply(0.35);
-    visuals.selection.stroke = egui::Stroke::new(1.0, ACCENT);
-
-    visuals.widgets.noninteractive.bg_fill = PANEL;
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, STROKE);
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, TEXT_WEAK);
-
-    visuals.widgets.inactive.bg_fill = WINDOW;
-    visuals.widgets.inactive.weak_bg_fill = WINDOW;
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, STROKE);
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, TEXT_STRONG);
-
-    visuals.widgets.hovered.bg_fill = RAISED;
-    visuals.widgets.hovered.weak_bg_fill = RAISED;
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, ACCENT.linear_multiply(0.6));
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, TEXT_STRONG);
-
-    visuals.widgets.active.bg_fill = RAISED;
-    visuals.widgets.active.weak_bg_fill = RAISED;
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, ACCENT);
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, TEXT_STRONG);
-
-    visuals.window_stroke = egui::Stroke::new(1.0, STROKE);
-    visuals.window_corner_radius = egui::CornerRadius::same(6);
-
-    ctx.set_visuals(visuals);
+/// Switch dark/light (re-applies visuals only; fonts/style persist).
+pub fn set_theme(ctx: &egui::Context, light: bool) {
+    tokens::set_active(light);
+    ctx.set_visuals(visuals_for(tokens::current(), light));
 }

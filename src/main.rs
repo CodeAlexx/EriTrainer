@@ -13,6 +13,7 @@ mod shell;
 mod sysmetrics;
 mod theme;
 mod tabs;
+mod tokens;
 mod topbar;
 mod widgets;
 
