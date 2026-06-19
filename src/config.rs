@@ -302,6 +302,9 @@ pub struct TrainConfig {
     /// Path to the EDv2 trainer `--config` JSON (e.g. configs/klein9b_alina.json).
     /// Required to launch; the runner reads dataset/recipe from it.
     pub run_config_path: String,
+    /// Secondary checkpoint for two-model trainers (asymflow `--asymflow-adapter`,
+    /// wan22 `--high-noise`). Empty for single-checkpoint models.
+    pub aux_model_path: String,
     pub vae_override: String,
     pub output_dir: String,
     pub output_model_format: String,
@@ -498,6 +501,7 @@ impl Default for TrainConfig {
 
             base_model_path: String::new(),
             run_config_path: String::new(),
+            aux_model_path: String::new(),
             vae_override: String::new(),
             output_dir: String::from("/home/alex/mojodiffusion/output"),
             output_model_format: String::from("SAFETENSORS"),
@@ -1067,6 +1071,15 @@ impl TrainConfig {
             String::from("Ready")
         }
     }
+}
+
+/// Models whose launch path has been smoke-verified end-to-end against the real
+/// EDv2 binary. The rest are wired but UNVERIFIED — do not rely until tested.
+pub fn model_verified(model_type: &str) -> bool {
+    matches!(
+        model_type,
+        "klein" | "sdxl" | "zimage" | "chroma" | "ernie" | "anima" | "hidream" | "sd35" | "l2p"
+    )
 }
 
 // --- Config persistence (save/load the UI config as JSON) ---

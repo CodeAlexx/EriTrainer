@@ -76,6 +76,14 @@ pub fn top_bar(ui: &mut egui::Ui, cfg: &mut TrainConfig, rt: &mut Runtime, secti
                     .color(theme::WARN),
             );
         }
+        // Newly-wired models are launch-wired but not smoke-tested — say so loud.
+        if !crate::config::model_verified(&cfg.model_type) {
+            ui.label(
+                egui::RichText::new("|  UNVERIFIED — launch wired but not smoke-tested")
+                    .strong()
+                    .color(theme::WARN),
+            );
+        }
 
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             // Save is rightmost in right_to_left layout → matches LTR order

@@ -444,6 +444,193 @@ fn launch_env(cfg: &TrainConfig) -> Vec<(String, String)> {
 /// Build (program, args) for the selected model's trainer. Only Klein is wired
 /// in M1; every other model returns Err so the launch fails loud instead of
 /// spawning a trainer with the wrong argv.
+// --- UNVERIFIED launch wiring for the remaining models (mirrored from each
+//     trainer's clap CLI; NOT yet smoke-tested — see config::model_verified). ---
+
+fn require(path: &str, what: &str) -> Result<(), String> {
+    if path.trim().is_empty() {
+        Err(format!("{what} is required"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Trailing flags common to most trainers: --steps/--rank/--lora-alpha/--lr,
+/// then optional --batch-size / --warmup-steps / --offload / --output-dir.
+fn common_train_flags(cfg: &TrainConfig, batch: bool, warmup: bool, offload: bool) -> Vec<String> {
+    let mut a = vec![
+        "--steps".to_string(),
+        (cfg.max_train_steps.max(1.0) as u64).to_string(),
+        "--rank".to_string(),
+        (cfg.lora_rank.max(1.0) as u64).to_string(),
+        "--lora-alpha".to_string(),
+        cfg.lora_alpha.to_string(),
+        "--lr".to_string(),
+        cfg.learning_rate.to_string(),
+    ];
+    if batch {
+        a.push("--batch-size".into());
+        a.push((cfg.batch_size.max(1.0) as u64).to_string());
+    }
+    if warmup {
+        a.push("--warmup-steps".into());
+        a.push((cfg.learning_rate_warmup_steps.max(0.0) as u64).to_string());
+    }
+    if offload && cfg.activation_offloading {
+        a.push("--offload".into());
+    }
+    if !cfg.output_dir.trim().is_empty() {
+        a.push("--output-dir".into());
+        a.push(cfg.output_dir.clone());
+    }
+    a
+}
+
+/// flux.1-dev: `--transformer` (file), `--config` optional, `--offload`, no batch.
+fn flux_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    require(&cfg.base_model_path, "base model path (--transformer)")?;
+    require(&cfg.cache_dir, "cache dir (--cache-dir)")?;
+    let mut a = Vec::new();
+    if !cfg.run_config_path.trim().is_empty() {
+        a.push("--config".into());
+        a.push(cfg.run_config_path.clone());
+    }
+    a.push("--cache-dir".into());
+    a.push(cfg.cache_dir.clone());
+    a.push("--transformer".into());
+    a.push(cfg.base_model_path.clone());
+    a.extend(common_train_flags(cfg, false, true, true));
+    Ok(a)
+}
+
+/// qwenimage: `--model` checkpoint, no config / batch / offload.
+fn qwenimage_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    require(&cfg.base_model_path, "base model path (--model)")?;
+    require(&cfg.cache_dir, "cache dir (--cache-dir)")?;
+    let mut a = vec![
+        "--cache-dir".into(),
+        cfg.cache_dir.clone(),
+        "--model".into(),
+        cfg.base_model_path.clone(),
+    ];
+    a.extend(common_train_flags(cfg, false, true, false));
+    Ok(a)
+}
+
+/// acestep (audio): `--model` checkpoint, no config / batch / offload.
+fn acestep_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    require(&cfg.base_model_path, "base model path (--model)")?;
+    require(&cfg.cache_dir, "cache dir (--cache-dir)")?;
+    let mut a = vec![
+        "--cache-dir".into(),
+        cfg.cache_dir.clone(),
+        "--model".into(),
+        cfg.base_model_path.clone(),
+    ];
+    a.extend(common_train_flags(cfg, false, true, false));
+    Ok(a)
+}
+
+/// ltx2 (video): `--config` required, NO checkpoint flag (model from config), batch.
+fn ltx2_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    require(&cfg.run_config_path, "run config path (--config)")?;
+    require(&cfg.cache_dir, "cache dir (--cache-dir)")?;
+    let mut a = vec![
+        "--config".into(),
+        cfg.run_config_path.clone(),
+        "--cache-dir".into(),
+        cfg.cache_dir.clone(),
+    ];
+    a.extend(common_train_flags(cfg, true, true, false));
+    Ok(a)
+}
+
+/// slider_klein: `--config` + `--transformer`, batch + offload.
+fn slider_klein_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    require(&cfg.run_config_path, "run config path (--config)")?;
+    require(&cfg.cache_dir, "cache dir (--cache-dir)")?;
+    require(&cfg.base_model_path, "base model path (--transformer)")?;
+    let mut a = vec![
+        "--config".into(),
+        cfg.run_config_path.clone(),
+        "--cache-dir".into(),
+        cfg.cache_dir.clone(),
+        "--transformer".into(),
+        cfg.base_model_path.clone(),
+    ];
+    a.extend(common_train_flags(cfg, true, true, true));
+    Ok(a)
+}
+
+/// asymflow: `--config` + `--transformer` + `--asymflow-adapter` (aux), batch + offload.
+fn asymflow_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    require(&cfg.run_config_path, "run config path (--config)")?;
+    require(&cfg.cache_dir, "cache dir (--cache-dir)")?;
+    require(&cfg.base_model_path, "base model path (--transformer)")?;
+    require(&cfg.aux_model_path, "aux model path (--asymflow-adapter)")?;
+    let mut a = vec![
+        "--config".into(),
+        cfg.run_config_path.clone(),
+        "--cache-dir".into(),
+        cfg.cache_dir.clone(),
+        "--transformer".into(),
+        cfg.base_model_path.clone(),
+        "--asymflow-adapter".into(),
+        cfg.aux_model_path.clone(),
+    ];
+    a.extend(common_train_flags(cfg, true, true, true));
+    Ok(a)
+}
+
+/// wan22 (video, 2-model): `--config` + `--low-noise` (base) [+ `--high-noise` aux]
+/// [+ `--vae`], batch + offload.
+fn wan22_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    require(&cfg.run_config_path, "run config path (--config)")?;
+    require(&cfg.cache_dir, "cache dir (--cache-dir)")?;
+    require(&cfg.base_model_path, "base model path (--low-noise)")?;
+    let mut a = vec![
+        "--config".into(),
+        cfg.run_config_path.clone(),
+        "--cache-dir".into(),
+        cfg.cache_dir.clone(),
+        "--low-noise".into(),
+        cfg.base_model_path.clone(),
+    ];
+    if !cfg.aux_model_path.trim().is_empty() {
+        a.push("--high-noise".into());
+        a.push(cfg.aux_model_path.clone());
+    }
+    if !cfg.vae_override.trim().is_empty() {
+        a.push("--vae".into());
+        a.push(cfg.vae_override.clone());
+    }
+    a.extend(common_train_flags(cfg, true, true, true));
+    Ok(a)
+}
+
+/// u1 (SenseNova U1): different shape — `--model-path` + `--steps` + `--lr`, plus
+/// optional `--data-dir` / `--lora-save-to`. No rank / lora-alpha / cache-dir.
+fn u1_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    require(&cfg.base_model_path, "base model path (--model-path)")?;
+    let mut a = vec![
+        "--model-path".into(),
+        cfg.base_model_path.clone(),
+        "--steps".into(),
+        (cfg.max_train_steps.max(1.0) as u64).to_string(),
+        "--lr".into(),
+        cfg.learning_rate.to_string(),
+    ];
+    if !cfg.dataset_path.trim().is_empty() {
+        a.push("--data-dir".into());
+        a.push(cfg.dataset_path.clone());
+    }
+    if !cfg.output_dir.trim().is_empty() {
+        a.push("--lora-save-to".into());
+        a.push(cfg.output_dir.clone());
+    }
+    Ok(a)
+}
+
 pub fn build_command(cfg: &TrainConfig) -> Result<(String, Vec<String>), String> {
     let (bin, args) = match cfg.model_type.as_str() {
         "klein" => ("train_klein", klein_args(cfg)?),
@@ -456,9 +643,18 @@ pub fn build_command(cfg: &TrainConfig) -> Result<(String, Vec<String>), String>
         "hidream" => ("train_hidream_o1", hidream_args(cfg)?),
         "sd35" => ("train_sd35", sd35_args(cfg)?),
         "l2p" => ("train_l2p", l2p_args(cfg)?),
+        // --- UNVERIFIED (wired from the CLI; not smoke-tested) ---
+        "flux" => ("train_flux", flux_args(cfg)?),
+        "qwenimage" => ("train_qwenimage", qwenimage_args(cfg)?),
+        "acestep" => ("train_acestep", acestep_args(cfg)?),
+        "ltx2" => ("train_ltx2", ltx2_args(cfg)?),
+        "slider_klein" => ("train_slider_klein", slider_klein_args(cfg)?),
+        "asymflow" => ("train_asymflow", asymflow_args(cfg)?),
+        "wan22" => ("train_wan22", wan22_args(cfg)?),
+        "u1" => ("train_u1", u1_args(cfg)?),
         other => {
             return Err(format!(
-                "launch for model '{other}' is not wired yet (wired: klein, sdxl, zimage, chroma, ernie, anima, hidream, sd35, l2p)"
+                "launch for model '{other}' is not wired (all 17 train_* are wired; unknown model_type)"
             ))
         }
     };
@@ -475,8 +671,14 @@ pub fn build_command(cfg: &TrainConfig) -> Result<(String, Vec<String>), String>
 /// sample asset is missing — several trainers default `--sample-every` to
 /// non-zero, which would otherwise try to sample with no assets and fail.
 fn sample_flags(cfg: &TrainConfig) -> Vec<String> {
-    // No in-trainer sampling flag exists for these — never emit anything.
-    if matches!(cfg.model_type.as_str(), "sdxl" | "anima") {
+    // No in-trainer sampling wired here — never emit sample flags. sdxl/anima
+    // use a separate sample bin; the newly-wired (unverified) models are not
+    // sampling-wired yet (and some lack `--sample-every`, which would clap-reject).
+    if matches!(
+        cfg.model_type.as_str(),
+        "sdxl" | "anima" | "flux" | "qwenimage" | "acestep" | "ltx2" | "slider_klein" | "asymflow"
+            | "wan22" | "u1"
+    ) {
         return Vec::new();
     }
     let off = vec![String::from("--sample-every"), String::from("0")];
@@ -1245,6 +1447,64 @@ mod tests {
         for m in ["sdxl", "anima"] {
             cfg.model_type = m.into();
             assert!(sample_flags(&cfg).is_empty(), "{m} must emit no --sample-* flags");
+        }
+    }
+
+    #[test]
+    fn sample_flags_new_models_emit_nothing() {
+        let mut cfg = TrainConfig::default();
+        cfg.sample_after = 100.0;
+        for m in ["flux", "qwenimage", "acestep", "ltx2", "slider_klein", "asymflow", "wan22", "u1"] {
+            cfg.model_type = m.into();
+            assert!(sample_flags(&cfg).is_empty(), "{m} must not emit sample flags (unverified)");
+        }
+    }
+
+    fn with_paths(model: &str) -> TrainConfig {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = model.into();
+        cfg.base_model_path = "/m.safetensors".into();
+        cfg.cache_dir = "/c".into();
+        cfg.run_config_path = "/cfg.json".into();
+        cfg.aux_model_path = "/aux.safetensors".into();
+        cfg.output_dir = "/out".into();
+        cfg
+    }
+
+    #[test]
+    fn new_models_checkpoint_flags() {
+        assert!(flux_args(&with_paths("flux")).unwrap().join(" ").contains("--transformer /m.safetensors"));
+        assert!(qwenimage_args(&with_paths("qwenimage")).unwrap().join(" ").contains("--model /m.safetensors"));
+        assert!(acestep_args(&with_paths("acestep")).unwrap().join(" ").contains("--model /m.safetensors"));
+        // ltx2: config-only, no checkpoint flag
+        let l = ltx2_args(&with_paths("ltx2")).unwrap().join(" ");
+        assert!(l.contains("--config /cfg.json") && !l.contains("--transformer"), "{l}");
+        assert!(slider_klein_args(&with_paths("slider_klein")).unwrap().join(" ").contains("--transformer /m.safetensors"));
+        // asymflow: needs the adapter
+        let a = asymflow_args(&with_paths("asymflow")).unwrap().join(" ");
+        assert!(a.contains("--asymflow-adapter /aux.safetensors"), "{a}");
+        // wan22: low-noise = base, high-noise = aux
+        let w = wan22_args(&with_paths("wan22")).unwrap().join(" ");
+        assert!(w.contains("--low-noise /m.safetensors") && w.contains("--high-noise /aux.safetensors"), "{w}");
+        // u1: model-path, no --rank
+        let u = u1_args(&with_paths("u1")).unwrap().join(" ");
+        assert!(u.contains("--model-path /m.safetensors") && !u.contains("--rank"), "{u}");
+    }
+
+    #[test]
+    fn asymflow_fails_loud_without_adapter() {
+        let mut cfg = with_paths("asymflow");
+        cfg.aux_model_path = String::new();
+        assert!(asymflow_args(&cfg).is_err());
+    }
+
+    #[test]
+    fn model_verified_flags_the_nine() {
+        for m in ["klein", "sdxl", "zimage", "chroma", "ernie", "anima", "hidream", "sd35", "l2p"] {
+            assert!(crate::config::model_verified(m), "{m} should be verified");
+        }
+        for m in ["flux", "qwenimage", "acestep", "ltx2", "slider_klein", "asymflow", "wan22", "u1"] {
+            assert!(!crate::config::model_verified(m), "{m} should be UNVERIFIED");
         }
     }
 

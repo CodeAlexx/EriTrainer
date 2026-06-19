@@ -72,8 +72,15 @@ binary's `Args` before wiring. Current mapping (`build_command`):
 
 Also wired: **l2p** (`train_l2p`, `--model`/`--cache`/`--output`/`--lora-rank`/
 `--train-shift`, grad-checkpoint on by default for the ~19.5GB pixel checkpoint).
-Deferred (not wired): flux-1-dev, qwenimage/qwen-edit, big models; wan22, ltx2,
-acestep, u1, asymflow, slider_klein.
+
+**All 17 models are now wired** in `build_command`. The 8 added last
+(flux `--transformer`, qwenimage/acestep `--model`, ltx2 config-only, slider_klein
+`--config`+`--transformer`, asymflow `--config`+`--transformer`+`--asymflow-adapter`,
+wan22 `--config`+`--low-noise`[+`--high-noise`/`--vae`], u1 `--model-path`/`--steps`/`--lr`)
+are **UNVERIFIED** — wired from each trainer's clap CLI but NOT smoke-tested.
+`config::model_verified()` returns false for them and the top bar shows an
+UNVERIFIED badge. `aux_model_path` carries the 2nd checkpoint (asymflow adapter,
+wan22 high-noise). They are NOT sampling-wired (sample_flags emits nothing).
 
 **Runner `--config` generation**: models requiring `--config` (klein/ernie/anima/
 sd35, see `needs_generated_config`) auto-write an EDv2-schema `TrainConfig` JSON
