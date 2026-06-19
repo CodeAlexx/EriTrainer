@@ -443,6 +443,12 @@ pub struct TrainConfig {
     pub sample_vae_path: String,
     pub sample_encoder_path: String,
     pub sample_tokenizer_path: String,
+    // SD3.5 extra sample encoders (it needs CLIP-L + CLIP-G + T5): the generic
+    // encoder/tokenizer above map to CLIP-L; these add CLIP-G and T5.
+    pub sample_clip_g_path: String,
+    pub sample_clip_g_tokenizer_path: String,
+    pub sample_t5_path: String,
+    pub sample_t5_tokenizer_path: String,
 
     // --- Backup ---
     pub backup_after: f32,
@@ -651,6 +657,10 @@ impl Default for TrainConfig {
             sample_vae_path: String::new(),
             sample_encoder_path: String::new(),
             sample_tokenizer_path: String::new(),
+            sample_clip_g_path: String::new(),
+            sample_clip_g_tokenizer_path: String::new(),
+            sample_t5_path: String::new(),
+            sample_t5_tokenizer_path: String::new(),
 
             backup_after: 500.0,
             rolling_backup: true,

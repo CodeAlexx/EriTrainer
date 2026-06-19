@@ -21,7 +21,7 @@ pub fn render(ui: &mut egui::Ui, cfg: &mut TrainConfig) {
         "ernie" => (true, "In-trainer sampling: set Sample VAE + Encoder (text) + Tokenizer below."),
         "l2p" => (true, "In-trainer sampling: set Sample Encoder (Qwen3) + Tokenizer below (pixel-space, no VAE)."),
         "hidream" => (true, "In-trainer sampling: enabled by 'Sample After' alone (assets load from the model dir)."),
-        "sd35" => (false, "SD3.5 in-trainer sampling needs CLIP-L + CLIP-G + T5 — not wired in this UI yet."),
+        "sd35" => (true, "In-trainer sampling: set VAE + CLIP-L (Encoder/Tokenizer) + CLIP-G + T5 below (all required)."),
         "sdxl" | "anima" => (false, "No in-trainer sampling for this model — it uses a separate sample bin."),
         _ => (false, "Unknown model."),
     };
@@ -49,6 +49,14 @@ pub fn render(ui: &mut egui::Ui, cfg: &mut TrainConfig) {
         browse_row(ui, "Sample VAE", &mut cfg.sample_vae_path, false);
         browse_row(ui, "Sample Encoder", &mut cfg.sample_encoder_path, false);
         browse_row(ui, "Sample Tokenizer", &mut cfg.sample_tokenizer_path, false);
+        // SD3.5 is a 3-encoder model: the generic Encoder/Tokenizer above are
+        // its CLIP-L; these add CLIP-G and T5 (all required to sample).
+        if cfg.model_type == "sd35" {
+            browse_row(ui, "Sample CLIP-G", &mut cfg.sample_clip_g_path, false);
+            browse_row(ui, "CLIP-G Tokenizer", &mut cfg.sample_clip_g_tokenizer_path, false);
+            browse_row(ui, "Sample T5", &mut cfg.sample_t5_path, false);
+            browse_row(ui, "T5 Tokenizer", &mut cfg.sample_t5_tokenizer_path, false);
+        }
     });
 
     form_panel(ui, "SAMPLE PROMPTS", "Prompts shown in the preview panel", |ui| {

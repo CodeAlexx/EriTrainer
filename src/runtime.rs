@@ -727,7 +727,33 @@ fn sample_flags(cfg: &TrainConfig) -> Vec<String> {
             }
             [pair("--sample-qwen3", enc), pair("--sample-tokenizer", tok)].concat()
         }
-        // sd35 needs a 3-encoder + 3-tokenizer asset set not modeled in the UI yet.
+        "sd35" => {
+            // SD3.5: VAE + CLIP-L (generic encoder/tokenizer) + CLIP-G + T5.
+            let cg = cfg.sample_clip_g_path.trim();
+            let cgt = cfg.sample_clip_g_tokenizer_path.trim();
+            let t5 = cfg.sample_t5_path.trim();
+            let t5t = cfg.sample_t5_tokenizer_path.trim();
+            if vae.is_empty()
+                || enc.is_empty()
+                || tok.is_empty()
+                || cg.is_empty()
+                || cgt.is_empty()
+                || t5.is_empty()
+                || t5t.is_empty()
+            {
+                return off;
+            }
+            [
+                pair("--sample-vae", vae),
+                pair("--sample-clip-l", enc),
+                pair("--sample-clip-l-tokenizer", tok),
+                pair("--sample-clip-g", cg),
+                pair("--sample-clip-g-tokenizer", cgt),
+                pair("--sample-t5", t5),
+                pair("--sample-t5-tokenizer", t5t),
+            ]
+            .concat()
+        }
         _ => return off,
     };
     let mut a = vec![
@@ -1174,6 +1200,7 @@ fn l2p_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Sample;
 
     #[test]
     fn parses_full_klein_progress_line() {
@@ -1448,6 +1475,43 @@ mod tests {
             cfg.model_type = m.into();
             assert!(sample_flags(&cfg).is_empty(), "{m} must emit no --sample-* flags");
         }
+    }
+
+    #[test]
+    fn sd35_sample_flags_need_all_seven_encoders() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "sd35".into();
+        cfg.sample_after = 100.0;
+        cfg.samples = vec![Sample {
+            prompt: "a cat".into(),
+            negative_prompt: String::new(),
+            seed: 0,
+        }];
+        cfg.sample_vae_path = "/vae".into();
+        cfg.sample_encoder_path = "/clipl".into();
+        cfg.sample_tokenizer_path = "/clipl_tok".into();
+        cfg.sample_clip_g_path = "/clipg".into();
+        cfg.sample_clip_g_tokenizer_path = "/clipg_tok".into();
+        cfg.sample_t5_path = "/t5".into();
+        cfg.sample_t5_tokenizer_path = "/t5_tok".into();
+        let j = sample_flags(&cfg).join(" ");
+        for f in [
+            "--sample-vae /vae",
+            "--sample-clip-l /clipl",
+            "--sample-clip-l-tokenizer /clipl_tok",
+            "--sample-clip-g /clipg",
+            "--sample-clip-g-tokenizer /clipg_tok",
+            "--sample-t5 /t5",
+            "--sample-t5-tokenizer /t5_tok",
+        ] {
+            assert!(j.contains(f), "missing `{f}` in `{j}`");
+        }
+        // Drop one encoder -> sampling disabled (fail-closed), never a partial set.
+        cfg.sample_t5_path = String::new();
+        assert_eq!(
+            sample_flags(&cfg),
+            vec!["--sample-every".to_string(), "0".to_string()]
+        );
     }
 
     #[test]
