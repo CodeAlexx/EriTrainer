@@ -55,6 +55,9 @@ and the schedule on **Training**, then **Start training**.
 - Shell, tabs, config model, live rail, and system metrics: built.
 - **Klein** launch path wired and verified end-to-end against the real `train_klein`
   binary (a short smoke run produced decreasing loss and a LoRA checkpoint).
+- **SDXL** launch path wired (`--unet`, optional `--config`, no `--batch-size`/`--offload`)
+  and verified against the real `train_sdxl` binary (accepts the generated argv and
+  reaches the cache stage).
 - Remaining: wire the other models' launch arguments (each `train_*` has its own CLI),
   and a polished live-GUI pass.
 

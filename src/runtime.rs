@@ -341,17 +341,18 @@ fn launch_env(cfg: &TrainConfig) -> Vec<(String, String)> {
 /// in M1; every other model returns Err so the launch fails loud instead of
 /// spawning a trainer with the wrong argv.
 pub fn build_command(cfg: &TrainConfig) -> Result<(String, Vec<String>), String> {
-    match cfg.model_type.as_str() {
-        "klein" => {
-            let args = klein_args(cfg)?;
-            let (program, mut full) = resolve_launcher("train_klein");
-            full.extend(args);
-            Ok((program, full))
+    let (bin, args) = match cfg.model_type.as_str() {
+        "klein" => ("train_klein", klein_args(cfg)?),
+        "sdxl" => ("train_sdxl", sdxl_args(cfg)?),
+        other => {
+            return Err(format!(
+                "launch for model '{other}' is not wired yet (wired: klein, sdxl)"
+            ))
         }
-        other => Err(format!(
-            "launch for model '{other}' is not wired yet (M1 wires Klein only)"
-        )),
-    }
+    };
+    let (program, mut full) = resolve_launcher(bin);
+    full.extend(args);
+    Ok((program, full))
 }
 
 /// Klein argv mirroring `train_klein.rs` clap flags. Fails loud on any missing
@@ -392,6 +393,52 @@ fn klein_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
     }
     if cfg.activation_offloading {
         a.push("--offload".into());
+    }
+    if cfg.min_snr_gamma_flow > 0.0 {
+        a.push("--min-snr-gamma".into());
+        a.push(cfg.min_snr_gamma_flow.to_string());
+    }
+    if cfg.caption_dropout > 0.0 {
+        a.push("--caption-dropout-probability".into());
+        a.push(cfg.caption_dropout.to_string());
+    }
+    Ok(a)
+}
+
+/// SDXL argv mirroring `train_sdxl.rs` clap flags. Differs from Klein: the
+/// checkpoint flag is `--unet` (not `--transformer`), `--config` is OPTIONAL,
+/// and there is NO `--batch-size` / `--offload` flag (passing them would make
+/// clap reject the launch). Fails loud on missing `--cache-dir` / `--unet`.
+fn sdxl_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    if cfg.cache_dir.trim().is_empty() {
+        return Err(String::from("cache dir (--cache-dir) is required"));
+    }
+    if cfg.base_model_path.trim().is_empty() {
+        return Err(String::from("base model path (--unet) is required"));
+    }
+    let mut a: Vec<String> = Vec::new();
+    // --config is optional for SDXL (defaults to TrainConfig::default()).
+    if !cfg.run_config_path.trim().is_empty() {
+        a.push("--config".into());
+        a.push(cfg.run_config_path.clone());
+    }
+    a.push("--cache-dir".into());
+    a.push(cfg.cache_dir.clone());
+    a.push("--unet".into());
+    a.push(cfg.base_model_path.clone());
+    a.push("--steps".into());
+    a.push((cfg.max_train_steps.max(1.0) as u64).to_string());
+    a.push("--rank".into());
+    a.push((cfg.lora_rank.max(1.0) as u64).to_string());
+    a.push("--lora-alpha".into());
+    a.push(cfg.lora_alpha.to_string());
+    a.push("--lr".into());
+    a.push(cfg.learning_rate.to_string());
+    a.push("--warmup-steps".into());
+    a.push((cfg.learning_rate_warmup_steps.max(0.0) as u64).to_string());
+    if !cfg.output_dir.trim().is_empty() {
+        a.push("--output-dir".into());
+        a.push(cfg.output_dir.clone());
     }
     if cfg.min_snr_gamma_flow > 0.0 {
         a.push("--min-snr-gamma".into());
@@ -501,7 +548,42 @@ mod tests {
     #[test]
     fn build_command_rejects_unwired_model() {
         let mut cfg = TrainConfig::default();
-        cfg.model_type = "sdxl".into();
+        cfg.model_type = "chroma".into(); // not yet wired
         assert!(build_command(&cfg).is_err());
+    }
+
+    #[test]
+    fn sdxl_args_uses_unet_and_omits_batch_size() {
+        let mut cfg = TrainConfig::default();
+        cfg.architecture_index = 3;
+        cfg.apply_model_preset(false); // sdxl
+        cfg.cache_dir = "/cache/sdxl".into();
+        cfg.base_model_path = "/models/sdxl_unet.safetensors".into();
+        cfg.max_train_steps = 500.0;
+        let joined = sdxl_args(&cfg).expect("sdxl args ok").join(" ");
+        assert!(joined.contains("--unet /models/sdxl_unet.safetensors"), "{joined}");
+        assert!(joined.contains("--cache-dir /cache/sdxl"), "{joined}");
+        assert!(joined.contains("--steps 500"), "{joined}");
+        assert!(!joined.contains("--transformer"), "sdxl uses --unet not --transformer: {joined}");
+        assert!(!joined.contains("--batch-size"), "train_sdxl has no --batch-size: {joined}");
+        assert!(!joined.contains("--offload"), "train_sdxl has no --offload: {joined}");
+    }
+
+    #[test]
+    fn sdxl_config_is_optional() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "sdxl".into();
+        cfg.cache_dir = "/cache/sdxl".into();
+        cfg.base_model_path = "/models/u.safetensors".into();
+        let a = sdxl_args(&cfg).expect("ok without a run config");
+        assert!(!a.join(" ").contains("--config"), "no --config when path empty");
+    }
+
+    #[test]
+    fn sdxl_args_fails_loud_on_missing_unet() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "sdxl".into();
+        cfg.cache_dir = "/cache/sdxl".into();
+        assert!(sdxl_args(&cfg).is_err());
     }
 }
