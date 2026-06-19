@@ -346,9 +346,10 @@ pub fn build_command(cfg: &TrainConfig) -> Result<(String, Vec<String>), String>
         "sdxl" => ("train_sdxl", sdxl_args(cfg)?),
         "zimage" => ("train_zimage", zimage_args(cfg)?),
         "chroma" => ("train_chroma", chroma_args(cfg)?),
+        "ernie" => ("train_ernie", ernie_args(cfg)?),
         other => {
             return Err(format!(
-                "launch for model '{other}' is not wired yet (wired: klein, sdxl, zimage, chroma)"
+                "launch for model '{other}' is not wired yet (wired: klein, sdxl, zimage, chroma, ernie)"
             ))
         }
     };
@@ -548,6 +549,51 @@ fn chroma_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
     Ok(a)
 }
 
+/// Ernie argv mirroring `train_ernie.rs` clap flags. DIFFERENT shape: there is
+/// NO checkpoint flag — `train_ernie` reads the model path from `--config`'s
+/// `base_model_name`, so `--config` is REQUIRED and `base_model_path` is NOT a
+/// CLI arg here (set it inside the run-config JSON instead). No `--batch-size`,
+/// no `--offload`.
+fn ernie_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    if cfg.run_config_path.trim().is_empty() {
+        return Err(String::from(
+            "run config path (--config) is required for Ernie (it reads the model path from the config's base_model_name)",
+        ));
+    }
+    if cfg.cache_dir.trim().is_empty() {
+        return Err(String::from("cache dir (--cache-dir) is required"));
+    }
+    let mut a: Vec<String> = vec![
+        "--config".into(),
+        cfg.run_config_path.clone(),
+        "--cache-dir".into(),
+        cfg.cache_dir.clone(),
+        "--steps".into(),
+        (cfg.max_train_steps.max(1.0) as u64).to_string(),
+        "--rank".into(),
+        (cfg.lora_rank.max(1.0) as u64).to_string(),
+        "--lora-alpha".into(),
+        cfg.lora_alpha.to_string(),
+        "--lr".into(),
+        cfg.learning_rate.to_string(),
+        "--warmup-steps".into(),
+        (cfg.learning_rate_warmup_steps.max(0.0) as u64).to_string(),
+    ];
+    if !cfg.output_dir.trim().is_empty() {
+        a.push("--output-dir".into());
+        a.push(cfg.output_dir.clone());
+    }
+    if cfg.min_snr_gamma_flow > 0.0 {
+        a.push("--min-snr-gamma".into());
+        a.push(cfg.min_snr_gamma_flow.to_string());
+    }
+    if cfg.caption_dropout > 0.0 {
+        a.push("--caption-dropout-probability".into());
+        a.push(cfg.caption_dropout.to_string());
+    }
+    Ok(a)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +660,21 @@ mod tests {
         assert!((s.grad_norm - 0.0076).abs() < 1e-6, "grad={}", s.grad_norm);
         assert!((s.speed_s_step - 5.3).abs() < 1e-6, "speed={}", s.speed_s_step);
         assert_eq!(s.eta_secs, 10);
+    }
+
+    #[test]
+    fn parses_real_train_ernie_run_line() {
+        // Captured verbatim from a real `target/release/train_ernie` run
+        // (3-step smoke on an 8-sample 512px cache, 2026-06-19).
+        let line = "[ERNIE-lora] step 1/3 | epoch 1/1 | loss 0.9406 | grad_norm 0.0021 | 3.4s/step | elapsed 0:00:03 | ETA 0:00:06";
+        let mut s = LiveStats::default();
+        assert!(parse_progress_line(line, &mut s));
+        assert_eq!(s.step, 1);
+        assert_eq!(s.total_steps, 3);
+        assert!((s.loss - 0.9406).abs() < 1e-6, "loss={}", s.loss);
+        assert!((s.grad_norm - 0.0021).abs() < 1e-6, "grad={}", s.grad_norm);
+        assert!((s.speed_s_step - 3.4).abs() < 1e-6, "speed={}", s.speed_s_step);
+        assert_eq!(s.eta_secs, 6);
     }
 
     #[test]
@@ -777,5 +838,22 @@ mod tests {
         cfg.model_type = "chroma".into();
         cfg.cache_dir = "/cache/chroma".into();
         assert!(chroma_args(&cfg).is_err());
+    }
+
+    #[test]
+    fn ernie_args_requires_config_and_has_no_checkpoint_flag() {
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "ernie".into();
+        cfg.cache_dir = "/cache/ernie".into();
+        // No run_config_path -> must fail loud (Ernie reads model from config).
+        assert!(ernie_args(&cfg).is_err());
+        cfg.run_config_path = "/cfg/boxjana_ernie_lora.json".into();
+        let joined = ernie_args(&cfg).expect("ernie args ok").join(" ");
+        assert!(joined.contains("--config /cfg/boxjana_ernie_lora.json"), "{joined}");
+        assert!(joined.contains("--cache-dir /cache/ernie"), "{joined}");
+        assert!(!joined.contains("--transformer"), "ernie has no checkpoint flag: {joined}");
+        assert!(!joined.contains("--unet"), "{joined}");
+        assert!(!joined.contains("--model "), "{joined}");
+        assert!(!joined.contains("--batch-size"), "train_ernie has no --batch-size: {joined}");
     }
 }
