@@ -23,6 +23,7 @@ pub fn render(ui: &mut egui::Ui, cfg: &mut TrainConfig) {
         "hidream" => (true, "In-trainer sampling: enabled by 'Sample After' alone (assets load from the model dir)."),
         "sd35" => (true, "In-trainer sampling: set CLIP-L (Encoder/Tokenizer) + CLIP-G + T5 below (VAE optional — falls back to checkpoint)."),
         "sdxl" | "anima" => (false, "No in-trainer sampling for this model — it uses a separate sample bin."),
+        "ideogram4" => (false, "In-trainer sampling not wired for Ideogram-4 yet (training verified; sample via serenitymojo ideogram4_generate_lora)."),
         _ => (false, "Unknown model."),
     };
     ui.label(

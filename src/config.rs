@@ -1164,7 +1164,8 @@ impl TrainConfig {
 pub fn model_verified(model_type: &str) -> bool {
     matches!(
         model_type,
-        "klein" | "sdxl" | "zimage" | "chroma" | "ernie" | "anima" | "hidream" | "sd35" | "l2p"
+        "ideogram4" | "klein" | "sdxl" | "zimage" | "chroma" | "ernie" | "anima" | "hidream" | "sd35"
+            | "l2p"
     )
 }
 

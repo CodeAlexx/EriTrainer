@@ -517,6 +517,29 @@ fn qwenimage_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
     Ok(a)
 }
 
+/// ideogram4: `--model` = the transformer safetensors FILE. The preset's base
+/// path is the diffusers DIR, so resolve `<dir>/transformer/diffusion_pytorch_model.safetensors`;
+/// a path already ending in `.safetensors` is used as-is. `--cache-dir` =
+/// prepare_ideogram output. No batch/offload; warmup supported.
+fn ideogram_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
+    require(&cfg.base_model_path, "base model path (Ideogram-4 dir or transformer .safetensors)")?;
+    require(&cfg.cache_dir, "cache dir (--cache-dir)")?;
+    let base = cfg.base_model_path.trim_end_matches('/');
+    let model = if base.ends_with(".safetensors") {
+        base.to_string()
+    } else {
+        format!("{base}/transformer/diffusion_pytorch_model.safetensors")
+    };
+    let mut a = vec![
+        "--cache-dir".into(),
+        cfg.cache_dir.clone(),
+        "--model".into(),
+        model,
+    ];
+    a.extend(common_train_flags(cfg, false, true, false));
+    Ok(a)
+}
+
 /// acestep (audio): `--model` checkpoint, no config / batch / offload.
 fn acestep_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
     require(&cfg.base_model_path, "base model path (--model)")?;
@@ -633,6 +656,7 @@ fn u1_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
 
 pub fn build_command(cfg: &TrainConfig) -> Result<(String, Vec<String>), String> {
     let (bin, args) = match cfg.model_type.as_str() {
+        "ideogram4" => ("train_ideogram", ideogram_args(cfg)?),
         "klein" => ("train_klein", klein_args(cfg)?),
         "sdxl" => ("train_sdxl", sdxl_args(cfg)?),
         "zimage" => ("train_zimage", zimage_args(cfg)?),
@@ -676,8 +700,8 @@ fn sample_flags(cfg: &TrainConfig) -> Vec<String> {
     // sampling-wired yet (and some lack `--sample-every`, which would clap-reject).
     if matches!(
         cfg.model_type.as_str(),
-        "sdxl" | "anima" | "flux" | "qwenimage" | "acestep" | "ltx2" | "slider_klein" | "asymflow"
-            | "wan22" | "u1"
+        "ideogram4" | "sdxl" | "anima" | "flux" | "qwenimage" | "acestep" | "ltx2" | "slider_klein"
+            | "asymflow" | "wan22" | "u1"
     ) {
         return Vec::new();
     }
@@ -1539,6 +1563,34 @@ mod tests {
         cfg.aux_model_path = "/aux.safetensors".into();
         cfg.output_dir = "/out".into();
         cfg
+    }
+
+    #[test]
+    fn ideogram_args_resolves_transformer_file_and_flags() {
+        // dir base path -> resolve to the transformer .safetensors file
+        let mut cfg = TrainConfig::default();
+        cfg.model_type = "ideogram4".into();
+        cfg.base_model_path = "/home/alex/.serenity/models/ideogram-4-fp8".into();
+        cfg.cache_dir = "/cache".into();
+        cfg.output_dir = "/out".into();
+        let j = ideogram_args(&cfg).unwrap().join(" ");
+        assert!(
+            j.contains("--model /home/alex/.serenity/models/ideogram-4-fp8/transformer/diffusion_pytorch_model.safetensors"),
+            "{j}"
+        );
+        assert!(j.contains("--cache-dir /cache") && j.contains("--steps") && j.contains("--rank"));
+        // an explicit .safetensors path is used as-is
+        cfg.base_model_path = "/m.safetensors".into();
+        assert!(ideogram_args(&cfg).unwrap().join(" ").contains("--model /m.safetensors"));
+        // build_command routes ideogram4 -> train_ideogram (bin appears in program or argv)
+        cfg.base_model_path = "/home/alex/.serenity/models/ideogram-4-fp8".into();
+        let (program, full) = build_command(&cfg).unwrap();
+        let cmd = format!("{program} {}", full.join(" "));
+        assert!(cmd.contains("train_ideogram"), "build_command missing train_ideogram: {cmd}");
+        // verified + no sample flags
+        assert!(crate::config::model_verified("ideogram4"));
+        cfg.sample_after = 100.0;
+        assert!(sample_flags(&cfg).is_empty());
     }
 
     #[test]
