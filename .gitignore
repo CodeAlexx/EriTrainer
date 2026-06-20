@@ -5,3 +5,6 @@ Cargo.lock
 # Dev-note markdown stays local, not in the repo (only README.md tracked)
 *.md
 !README.md
+
+# Training outputs (LoRAs, samples) stay local — never commit
+output/
