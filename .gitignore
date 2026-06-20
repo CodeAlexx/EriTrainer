@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 Cargo.lock
+
+# Dev-note markdown stays local, not in the repo (only README.md tracked)
+*.md
+!README.md
