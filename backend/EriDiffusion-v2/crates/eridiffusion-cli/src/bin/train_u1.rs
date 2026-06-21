@@ -1,0 +1,1107 @@
+//! train_u1 — SenseNova-U1-8B-MoT LoRA / mvp-finetune training binary.
+//!
+//! Mirrors `train_u1/scripts/train_bf16_offload.py` (config-driven). Two modes:
+//!
+//! * **Smoke mode** (no `--data-dir`): synthetic single-sample batch, used to
+//!   validate the autograd chain. Run with `FLAME_ASSERT_GRAD_FLOW=1`.
+//! * **Real-data mode** (`--data-dir <folder>`): scan paired `<id>.{jpg|png|webp}`
+//!   + `<id>.txt` files. Each step samples one (image, caption) pair, resizes
+//!   to `--image-hw`, normalizes to `[-1, 1]`, tokenizes the caption through the
+//!   official chat template, and runs one FM training step:
+//!     `x0 = patchify(image, p=32, channel_first=false)`
+//!     `eps ~ N(0,1)`
+//!     `t  ~ U(t_eps, 1]`
+//!     `z_t = t*x0 + (1-t)*eps`     (computed inside forward_t2i_step)
+//!     `noisy = unpatchify(z_t, p=32)`
+//!     forward_t2i_step → MSE(x_pred, x0) → backward → AdamW step
+//!
+//! Defaults mirror Python's `TrainConfig` in `train_u1/config.py`:
+//!     lr=5e-5, betas=(0.9, 0.95), seed=42, lora.preset="default" (r=64
+//!     attn+mlp+fm_head), grad_accum=1, checkpoint_every=500.
+
+use clap::Parser;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{anyhow, Context};
+use eridiffusion_cli::{trainer_common, trainer_pipeline};
+use flame_core::{CudaDevice, DType, Shape, Tensor};
+use tokenizers::models::bpe::BPE;
+use tokenizers::pre_tokenizers::byte_level::ByteLevel;
+use tokenizers::{AddedToken, Tokenizer};
+
+use eridiffusion_core::models::sensenova_u1::{self, SenseNovaU1};
+use eridiffusion_core::models::sensenova_u1_lora as u1lora;
+use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
+
+const SEED_DEFAULT: u64 = 42;
+
+const SYSTEM_MESSAGE_FOR_GEN: &str = concat!(
+    "You are an image generation and editing assistant that accurately understands and executes ",
+    "user intent.\n\nYou support two modes:\n\n",
+    "1. Think Mode:\nIf the task requires reasoning, you MUST start with a <think></think> block. ",
+    "Put all reasoning inside the block using plain text. DO NOT include any image tags. ",
+    "Keep it reasonable and directly useful for producing the final image.\n\n",
+    "2. Non-Think Mode:\nIf no reasoning is needed, directly produce the final image.\n\n",
+    "Task Types:\n\nA. Text-to-Image Generation:\n",
+    "- Generate a high-quality image based on the user's description.\n",
+    "- Ensure visual clarity, semantic consistency, and completeness.\n",
+    "- DO NOT introduce elements that contradict or override the user's intent.\n\n",
+    "B. Image Editing:\n",
+    "- Use the provided image(s) as input or reference for modification or transformation.\n",
+    "- The result can be an edited image or a new image based on the reference(s).\n",
+    "- Preserve all unspecified attributes unless explicitly changed.\n\n",
+    "General Rules:\n",
+    "- For any visible text in the image, follow the language specified for the rendered text in ",
+    "the user's description, not the language of the prompt. If no language is specified, use the ",
+    "user's input language."
+);
+
+#[derive(Parser)]
+#[command(about = "SenseNova-U1-8B-MoT LoRA / mvp training binary.")]
+struct Args {
+    /// Directory containing the 8-shard `model.safetensors.index.json` +
+    /// `model-{i}-of-{N}.safetensors` files + `vocab.json` + `merges.txt`
+    /// + `added_tokens.json`.
+    #[arg(long)]
+    model_path: PathBuf,
+
+    /// Folder mode dataset directory (image+caption pairs). When omitted,
+    /// runs in smoke mode with a single synthetic sample.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+
+    /// Number of training steps. Python's default for full runs is 6000;
+    /// 2000 is a reasonable LoRA fit.
+    #[arg(long, default_value = "3")]
+    steps: usize,
+
+    /// Adam learning rate. Python's default = 5e-5 across all scenarios.
+    #[arg(long, default_value = "5e-5")]
+    lr: f32,
+
+    #[arg(long, default_value_t = SEED_DEFAULT)]
+    seed: u64,
+
+    /// Square image side. Must be divisible by `patch_size * merge_size = 32`.
+    /// Default keeps activations tight on 24 GB; raise carefully.
+    #[arg(long, default_value = "512")]
+    image_hw: usize,
+
+    /// Smoke-mode synthetic text-prefix length (ignored when --data-dir set).
+    #[arg(long, default_value = "24")]
+    text_len: usize,
+
+    /// Optional output path for the final mvp F32 master state (safetensors).
+    #[arg(long)]
+    save_to: Option<PathBuf>,
+
+    /// LoRA preset name: `default` (r64 attn+mlp+fm_head), `attn_only`,
+    /// `attn_mlp`, `official_r128`. Mutually exclusive with `--lora-spec`.
+    #[arg(long, conflicts_with = "lora_spec")]
+    lora_preset: Option<String>,
+
+    /// LoRA spec string, e.g. `attn=r64a64;mlp=r64a64;fm_head=r128a128`.
+    #[arg(long)]
+    lora_spec: Option<String>,
+
+    /// Output path for the LoRA PEFT-format save.
+    #[arg(long)]
+    lora_save_to: Option<PathBuf>,
+
+    /// Resume LoRA training from a PEFT-format checkpoint. Loads the
+    /// down/up/alpha tensors from disk and OVERWRITES the freshly-built
+    /// adapters from spec, preserving Parameter TensorIds so AdamW state
+    /// (built on first opt.step) is still keyed correctly. Optimizer m/v
+    /// state itself is NOT restored — momentum re-warms over ~10-20 steps.
+    /// Combine with --resume-step to keep the progress UI honest.
+    #[arg(long)]
+    resume_lora: Option<PathBuf>,
+
+    /// Absolute step the resumed run picks up at (e.g. 100 when resuming
+    /// from a `.step000100.safetensors` checkpoint). Display shows
+    /// `step (resume_step + i + 1)/steps`; ETA = run-local s/step ×
+    /// remaining absolute steps. Auto-detected from the resume filename
+    /// when omitted (parses `.stepNNNNNN.safetensors` suffix).
+    #[arg(long, default_value = "0")]
+    resume_step: usize,
+
+    /// Save a checkpoint every N steps. 0 disables.
+    #[arg(long, default_value = "0")]
+    checkpoint_every: usize,
+
+    /// Gradient accumulation steps. Default 1 = no accumulation.
+    #[arg(long, default_value = "1")]
+    grad_accum: usize,
+
+    /// Shuffle dataset order (real-data mode only).
+    #[arg(long, default_value = "true")]
+    shuffle: bool,
+
+    /// Optimizer kind. Adafactor avoids the m+v state of AdamW (~600 MB at
+    /// default preset) — useful when training at 2048² on 24 GB.
+    #[arg(long, default_value = "adamw")]
+    optimizer: String,
+
+    /// SerenityBoard SQLite output directory. When set, training emits
+    /// loss/grad_norm/lr/steps_per_sec scalars to `<board-dir>/board.db`
+    /// alongside the stdout progress lines (universal display).
+    #[arg(long)]
+    board_dir: Option<PathBuf>,
+
+    // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
+    /// Route the backward pass through `AutogradContext::backward_v2`
+    /// (`MatchInsertedDtype` policy → BF16 grads end-to-end). Default OFF
+    /// preserves v3 byte-equivalence. See train_zimage.rs:269 for full doc.
+    #[arg(long, default_value_t = false)]
+    use_autograd_v2: bool,
+
+    /// Opt OUT of autograd v2 and run the legacy v3 engine. v2 is the default
+    /// as of 2026-05-30 (gate-on Stage 6a); v3 kept as the reference engine.
+    /// `--use-autograd-v2` remains accepted as a back-compat no-op.
+    #[arg(long, default_value_t = false, conflicts_with = "use_autograd_v2")]
+    use_autograd_v3: bool,
+
+    /// Promote weights matching ANY of these comma-separated regexes to
+    /// trainable F32 Parameters (additive — combine freely with
+    /// `--lora-preset` for v16c-style "LoRA + partial-FT" recipes).
+    /// Without `--lora-preset`/`--lora-spec` this replaces the default mvp
+    /// surface entirely (mvp is no longer applied — the regex list IS the
+    /// trainable surface).
+    ///
+    /// Example (v16c, full):
+    ///   --unfreeze '^fm_modules\.timestep_embedder\.,^fm_modules\.noise_scale_embedder\.,^fm_modules\.vision_model_mot_gen\.,^fm_modules\.fm_head\.'
+    #[arg(long)]
+    unfreeze: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Tokenizer helpers (shared with sample_u1.rs — could be extracted into a
+// shared module later, but keeping the bin self-contained for now).
+// ---------------------------------------------------------------------------
+
+fn build_tokenizer(weights_dir: &Path) -> anyhow::Result<Tokenizer> {
+    let vocab = weights_dir.join("vocab.json");
+    let merges = weights_dir.join("merges.txt");
+    let added = weights_dir.join("added_tokens.json");
+
+    let bpe = BPE::from_file(
+        vocab.to_str().context("vocab path not utf-8")?,
+        merges.to_str().context("merges path not utf-8")?,
+    )
+    .build()
+    .map_err(|e| anyhow!("BPE::build failed: {e}"))?;
+
+    let mut tok = Tokenizer::new(bpe);
+    tok.with_pre_tokenizer(Some(ByteLevel::default().add_prefix_space(false)));
+    tok.with_decoder(Some(ByteLevel::default()));
+
+    let raw =
+        std::fs::read_to_string(&added).with_context(|| format!("read {}", added.display()))?;
+    let map: serde_json::Map<String, serde_json::Value> =
+        serde_json::from_str(&raw).context("added_tokens.json")?;
+    let mut entries: Vec<(String, u64)> = map
+        .into_iter()
+        .filter_map(|(k, v)| v.as_u64().map(|id| (k, id)))
+        .collect();
+    entries.sort_by_key(|(_, id)| *id);
+
+    let added_tokens: Vec<AddedToken> = entries
+        .into_iter()
+        .map(|(content, _)| AddedToken::from(content, true))
+        .collect();
+    tok.add_special_tokens(&added_tokens);
+    Ok(tok)
+}
+
+fn build_t2i_query(system: &str, user: &str, append: &str) -> String {
+    let mut q = String::new();
+    if !system.is_empty() {
+        q.push_str("<|im_start|>system\n");
+        q.push_str(system);
+        q.push_str("<|im_end|>\n");
+    }
+    q.push_str("<|im_start|>user\n");
+    q.push_str(user);
+    q.push_str("<|im_end|>\n");
+    q.push_str("<|im_start|>assistant\n");
+    q.push_str(append);
+    q
+}
+
+fn encode_query(tok: &Tokenizer, query: &str) -> anyhow::Result<Vec<i32>> {
+    let enc = tok
+        .encode(query, false)
+        .map_err(|e| anyhow!("tokenize: {e}"))?;
+    Ok(enc.get_ids().iter().map(|&id| id as i32).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Folder dataset: scan <id>.{jpg|png|webp} + <id>.txt pairs
+// ---------------------------------------------------------------------------
+
+#[derive(Clone, Debug)]
+struct SamplePair {
+    image_path: PathBuf,
+    caption_path: PathBuf,
+    sample_id: String,
+}
+
+fn scan_dataset(dir: &Path) -> anyhow::Result<Vec<SamplePair>> {
+    let exts: &[&str] = &["jpg", "jpeg", "png", "webp"];
+    let mut out: Vec<SamplePair> = Vec::new();
+    for entry in std::fs::read_dir(dir).with_context(|| format!("read_dir {}", dir.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        let ext = path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if !exts.iter().any(|e| *e == ext.as_str()) {
+            continue;
+        }
+        let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+        if stem.is_empty() {
+            continue;
+        }
+        let cap = path.with_extension("txt");
+        if !cap.exists() {
+            continue;
+        }
+        out.push(SamplePair {
+            image_path: path.clone(),
+            caption_path: cap,
+            sample_id: stem.to_string(),
+        });
+    }
+    out.sort_by(|a, b| a.sample_id.cmp(&b.sample_id));
+    Ok(out)
+}
+
+/// Load image, resize to `target_hw x target_hw`, normalize to `[-1, 1]`
+/// (x0 space: `(pixel/255 - 0.5)/0.5`), return BF16 tensor `[1, 3, H, W]`.
+fn load_image_x0(
+    path: &Path,
+    target_hw: usize,
+    device: &Arc<CudaDevice>,
+) -> anyhow::Result<Tensor> {
+    let img = image::open(path)
+        .with_context(|| format!("open image {}", path.display()))?
+        .to_rgb8();
+    let resized = image::imageops::resize(
+        &img,
+        target_hw as u32,
+        target_hw as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let h = resized.height() as usize;
+    let w = resized.width() as usize;
+    let mut chw = vec![0.0_f32; 3 * h * w];
+    for y in 0..h {
+        for x in 0..w {
+            let px = resized.get_pixel(x as u32, y as u32);
+            for c in 0..3 {
+                let v = px[c] as f32 / 255.0;
+                let v_norm = (v - 0.5) / 0.5; // -> [-1, 1]
+                chw[c * h * w + y * w + x] = v_norm;
+            }
+        }
+    }
+    let t = Tensor::from_vec(chw, Shape::from_dims(&[1, 3, h, w]), device.clone())?;
+    Ok(t.to_dtype(DType::BF16)?)
+}
+
+// ---------------------------------------------------------------------------
+// Misc helpers
+// ---------------------------------------------------------------------------
+
+fn gaussian_bf16(seed: u64, shape: &[usize], device: &Arc<CudaDevice>) -> anyhow::Result<Tensor> {
+    use rand::{Rng, SeedableRng};
+    let numel: usize = shape.iter().product();
+    let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+    let mut data = Vec::with_capacity(numel);
+    for _ in 0..numel {
+        let u1: f32 = rng.gen_range(f32::EPSILON..1.0);
+        let u2: f32 = rng.gen();
+        data.push((-2.0 * u1.ln()).sqrt() * (2.0 * std::f32::consts::PI * u2).cos());
+    }
+    let t = Tensor::from_vec(data, Shape::from_dims(shape), device.clone())?;
+    Ok(t.to_dtype(DType::BF16)?)
+}
+
+fn save_lora_checkpoint(
+    model: &SenseNovaU1,
+    device: &Arc<CudaDevice>,
+    path: &Path,
+) -> anyhow::Result<()> {
+    u1lora::save_adapters(model.lora_adapters(), path, device)
+        .map_err(|e| anyhow!("save_adapters {:?}: {e}", path))?;
+    // Sidecar: promoted Parameters (unfreeze / mvp) as raw BF16 tensors. Without
+    // this, `--unfreeze`-trained weights revert to base at inference — bug
+    // verified on v16c 1000-step run (0 raw keys in 819 MB LoRA file).
+    save_promoted_params_sidecar(model, path)?;
+    Ok(())
+}
+
+/// Write `<path>.params.safetensors` containing promoted Parameters (unfreeze
+/// or mvp) as BF16 tensors keyed by their full `model.shared` path. No-op +
+/// info log when nothing is promoted (LoRA-only mode).
+fn save_promoted_params_sidecar(model: &SenseNovaU1, lora_path: &Path) -> anyhow::Result<()> {
+    let named = u1lora::collect_promoted_named(model);
+    if named.is_empty() {
+        log::info!("[u1 save] skipping params sidecar (no promoted Parameters)");
+        return Ok(());
+    }
+    let sidecar = params_sidecar_path(lora_path);
+    let (n, bytes) = u1lora::save_promoted_params(&named, &sidecar)
+        .map_err(|e| anyhow!("save_promoted_params {:?}: {e}", sidecar))?;
+    log::info!(
+        "[u1 save] wrote {n} promoted Parameters to {} ({:.1} MB)",
+        sidecar.display(),
+        bytes as f64 / 1.0e6,
+    );
+    Ok(())
+}
+
+/// Sidecar naming convention: replace `.safetensors` suffix with
+/// `.params.safetensors`. E.g.:
+///   * `out/alina.safetensors`               → `out/alina.params.safetensors`
+///   * `out/alina.step001000.safetensors`    → `out/alina.step001000.params.safetensors`
+fn params_sidecar_path(lora_path: &Path) -> std::path::PathBuf {
+    // Strip the final `.safetensors` extension, append `.params.safetensors`.
+    // `Path::with_extension("params.safetensors")` does the right thing here
+    // because it replaces the LAST extension component, so `.step001000` is
+    // preserved as part of the stem.
+    lora_path.with_extension("params.safetensors")
+}
+
+fn main() -> anyhow::Result<()> {
+    trainer_common::init_logging();
+    let args = Args::parse();
+
+    let device = trainer_common::init_cuda_index(0)?;
+    log::info!("[train_u1] using device 0");
+
+    // ---- LoRA specs ------------------------------------------------------
+    let lora_specs: Option<Vec<u1lora::LoraSpec>> = match (&args.lora_preset, &args.lora_spec) {
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
+        (Some(p), None) => Some(u1lora::resolve_preset(p)?),
+        (None, Some(s)) => Some(u1lora::parse_lora_spec_str(s)?),
+        (None, None) => None,
+    };
+    let use_lora = lora_specs.is_some();
+
+    // ---- Parse --unfreeze regex list (comma-separated) -------------------
+    // Empty / unset → no regex-driven promotion. Otherwise we capture the
+    // list now and apply AFTER the base load, regardless of whether LoRA is
+    // also active (combined recipes = v16c).
+    let unfreeze_regexes: Vec<String> = match args.unfreeze.as_ref() {
+        None => Vec::new(),
+        Some(s) => s
+            .split(',')
+            .map(|p| p.trim())
+            .filter(|p| !p.is_empty())
+            .map(|p| p.to_string())
+            .collect(),
+    };
+    let use_unfreeze = !unfreeze_regexes.is_empty();
+    if use_unfreeze {
+        log::info!(
+            "[train_u1] --unfreeze: {} regex(es) to promote as trainable F32 Parameters",
+            unfreeze_regexes.len(),
+        );
+        for (i, r) in unfreeze_regexes.iter().enumerate() {
+            log::info!("  - regex #{i}: {r}");
+        }
+    }
+
+    // ---- Load model ------------------------------------------------------
+    log::info!(
+        "[train_u1] loading model from {}",
+        args.model_path.display()
+    );
+    let mut model = if use_lora {
+        let specs = lora_specs.as_ref().unwrap();
+        log::info!("[train_u1] LoRA specs: {} target(s)", specs.len());
+        for s in specs {
+            log::info!(
+                "  - target={:<24} r={:<3} alpha={:<5} enabled={}",
+                s.target,
+                s.r,
+                s.alpha,
+                s.enabled,
+            );
+        }
+        SenseNovaU1::load_for_training_lora(&args.model_path, &device, specs, args.seed)?
+    } else if use_unfreeze {
+        // Unfreeze-only path: skip the hardcoded mvp surface entirely; the
+        // `--unfreeze` regex list IS the trainable surface. Caller is on the
+        // hook for picking regexes that cover what they want to train.
+        log::info!(
+            "[train_u1] unfreeze-only mode (no --lora-preset): mvp surface NOT auto-applied",
+        );
+        SenseNovaU1::load(&args.model_path, &device)?
+    } else {
+        SenseNovaU1::load_for_training_mvp(&args.model_path, &device)?
+    };
+
+    // ---- Apply --unfreeze regex-driven promotion -------------------------
+    // Additive: extends `trainable_params` regardless of LoRA / mvp state.
+    // For combined LoRA + unfreeze (v16c), this promotes alongside the LoRA
+    // adapters; `model.parameters()` will enumerate both groups.
+    if use_unfreeze {
+        let promoted = model.promote_unfreeze(&unfreeze_regexes)?;
+        log::info!(
+            "[train_u1] --unfreeze: promoted {} Parameters from regex list",
+            promoted,
+        );
+    }
+
+    // ---- Resume from prior LoRA checkpoint --------------------------------
+    // Must happen BEFORE `model.parameters()` so the optimizer keys onto the
+    // newly-attached Parameters' TensorIds (not the discarded fresh-init
+    // ones). Loaded adapters fully replace per-key entries in the model's
+    // LoRA HashMap.
+    // Auto-detect resume_step from filename pattern `.stepNNNNNN.safetensors`
+    // when the user didn't pass --resume-step explicitly.
+    let mut resume_step = args.resume_step;
+    if let Some(resume_path) = args.resume_lora.as_ref() {
+        if !use_lora {
+            anyhow::bail!(
+                "--resume-lora requires --lora-preset or --lora-spec (resume \
+                 needs the same LoRA target shape as the saved checkpoint)"
+            );
+        }
+        if resume_step == 0 {
+            // Parse `.stepNNNNNN.safetensors` suffix from the filename.
+            if let Some(stem) = resume_path.file_stem().and_then(|s| s.to_str()) {
+                if let Some(idx) = stem.rfind(".step") {
+                    let tail = &stem[idx + 5..];
+                    let num_str: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+                    if !num_str.is_empty() {
+                        if let Ok(n) = num_str.parse::<usize>() {
+                            resume_step = n;
+                            log::info!(
+                                "[train_u1] auto-detected resume_step={} from filename",
+                                resume_step,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        log::info!("[train_u1] resuming LoRA from {}", resume_path.display());
+        let loaded = u1lora::load_adapters(resume_path, device.clone())?;
+        let expected = model.lora_adapters().len();
+        if loaded.len() != expected {
+            log::warn!(
+                "[train_u1] checkpoint has {} adapters, current spec expects {} — \
+                 keys present in both will be loaded; mismatches kept fresh-init",
+                loaded.len(),
+                expected,
+            );
+        }
+        log::info!("[train_u1] attaching {} loaded LoRA adapters", loaded.len());
+        model.attach_lora_adapters(loaded);
+
+        // Promoted-Parameter sidecar: if `<resume>.params.safetensors` exists,
+        // inject into `model.shared` AND re-promote via `promote_unfreeze`.
+        // The inject step overrides the base BF16 weights with the values the
+        // sidecar saved (trained F32 master cast to BF16); the re-promote
+        // step then rebuilds the F32 master from those now-overridden BF16
+        // values, so training continues from where it stopped.
+        //
+        // AdamW m/v state remains lost across resume (existing behavior —
+        // momentum re-warms over ~10-20 steps). Only Parameter VALUES resume
+        // cleanly; the optimizer state is fresh each invocation.
+        let sidecar = params_sidecar_path(resume_path);
+        if sidecar.exists() {
+            log::info!(
+                "[train_u1] resuming promoted Parameters from {}",
+                sidecar.display(),
+            );
+            let overrides = u1lora::load_promoted_params(&sidecar, device.clone())?;
+            let n_loaded = overrides.len();
+            let (injected, skipped) = u1lora::inject_shared_overrides(&mut model, overrides);
+            log::info!(
+                "[train_u1] sidecar: loaded {n_loaded} tensors, injected {injected} into \
+                 model.shared, skipped {skipped} (key mismatches)"
+            );
+            // Re-promote so F32 master Parameters are rebuilt from the now-
+            // overridden BF16 base. NOTE: this uses the regex list from THIS
+            // run's `--unfreeze` flag — if the user is resuming with a
+            // different regex set than the original run, the sidecar's keys
+            // outside the new regex will sit in `shared` as dead overrides
+            // (no Parameter wrapped, so optimizer won't touch them, but the
+            // forward path still reads them via the frozen path → those
+            // keys' trained values are USED but no longer trained). This is
+            // graceful, not a hard error — user might intentionally narrow
+            // the trainable surface mid-run.
+            if use_unfreeze {
+                let promoted = model.promote_unfreeze(&unfreeze_regexes)?;
+                log::info!(
+                    "[train_u1] sidecar resume: re-promoted {promoted} Parameters via current \
+                     --unfreeze regex set ({} regex(es))",
+                    unfreeze_regexes.len(),
+                );
+            } else {
+                log::warn!(
+                    "[train_u1] sidecar present but current run has no --unfreeze regex; \
+                     sidecar values were injected into model.shared (read by forward) but no \
+                     Parameter is wrapped — promoted-Parameter training will NOT continue"
+                );
+            }
+        } else {
+            log::info!(
+                "[train_u1] no params sidecar at {} — proceeding with base-model weights for \
+                 non-LoRA layers",
+                sidecar.display(),
+            );
+        }
+    }
+
+    let mut params = model.parameters();
+    // Gate-on 6a: under v2 (default), flip LoRA params to MatchParamDtype so
+    // BF16 grads from the bridge stay BF16 (Class A). --use-autograd-v3 skips.
+    trainer_pipeline::apply_autograd_v2_grad_policy(&mut params, args.use_autograd_v3, "params");
+    log::info!("[train_u1] {} trainable Parameters", params.len());
+    if params.is_empty() {
+        anyhow::bail!("no trainable parameters — loader failed silently");
+    }
+
+    let opt_kind = match args.optimizer.to_lowercase().as_str() {
+        "adamw" => OptimizerKind::AdamW,
+        // Python's U1 trainer uses bnb.optim.PagedAdamW8bit — 8-bit moment
+        // state, ~4× smaller than F32 m+v. The project-wide no-quantization
+        // rule is Z-Image-only; Wan22 + U1 are documented exceptions.
+        "adamw8bit" | "adamw_8bit" => OptimizerKind::AdamW8bit,
+        "adafactor" => OptimizerKind::Adafactor,
+        "lion" => OptimizerKind::Lion,
+        "prodigy" => OptimizerKind::Prodigy,
+        "stable_adamw" | "stableadamw" => OptimizerKind::StableAdamW,
+        other => anyhow::bail!(
+            "unknown --optimizer {other:?}; valid: adamw | adamw8bit | adafactor | lion | prodigy | stable_adamw"
+        ),
+    };
+    let mut opt = Optimizer::new(opt_kind, args.lr, 0.9, 0.95, 1e-8, 0.0);
+    log::info!(
+        "[train_u1] optimizer={:?}(lr={})  grad_accum={}",
+        opt_kind,
+        args.lr,
+        args.grad_accum,
+    );
+
+    // ---- SerenityBoard writer --------------------------------------------
+    // Resolve the board output directory: prefer the explicit `--board-dir`,
+    // else fall back to the parent of `--lora-save-to` / `--save-to` so the
+    // board.db lands next to the checkpoints, else skip (no board). board.db
+    // is written under the resolved directory by `BoardWriter::open`.
+    let board_dir: Option<PathBuf> = args.board_dir.clone().or_else(|| {
+        args.lora_save_to
+            .as_ref()
+            .or(args.save_to.as_ref())
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+            .filter(|d| !d.as_os_str().is_empty())
+    });
+    let board = if let Some(dir) = board_dir.as_ref() {
+        trainer_common::open_board_writer(
+            dir,
+            trainer_common::board_resume_step(resume_step),
+        )
+    } else {
+        log::info!(
+            "[train_u1] no --board-dir and no save path with a parent dir — \
+             SerenityBoard logging disabled"
+        );
+        None
+    };
+    if let Some(b) = &board {
+        // Full board wiring: run hyper-parameters → metadata.hparams + the
+        // dashboard's hparam panel. JSON hand-built (no serde dep here). LoRA
+        // rank/alpha are per-spec on U1 (no single scalar), so we report the
+        // spec count + the preset/spec string instead of one rank value.
+        let lora_desc = args
+            .lora_preset
+            .clone()
+            .or_else(|| args.lora_spec.clone())
+            .unwrap_or_else(|| {
+                if use_lora {
+                    "spec".into()
+                } else {
+                    "none".into()
+                }
+            });
+        let mode = if use_lora {
+            "lora"
+        } else if use_unfreeze {
+            "unfreeze"
+        } else {
+            "mvp"
+        };
+        let hparams_json = format!(
+            "{{\"model\":\"sensenova-u1\",\"steps\":{},\"lr\":{},\"optimizer\":\"{}\",\
+             \"seed\":{},\"batch_size\":{},\"grad_accum\":{},\"image_hw\":{},\
+             \"mode\":\"{}\",\"lora\":\"{}\",\"resume_step\":{},\"trainable_params\":{}}}",
+            args.steps,
+            args.lr,
+            opt_kind.as_str(),
+            args.seed,
+            1,
+            args.grad_accum,
+            args.image_hw,
+            mode,
+            lora_desc,
+            resume_step,
+            params.len(),
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
+    }
+
+    // ---- Geometry --------------------------------------------------------
+    let (p, merge, fm_dim, t_eps, bos_id, add_ns_embed, ns_max, ns_base_seq, ns_value) = {
+        let cfg = model.config();
+        (
+            cfg.patch_size,
+            cfg.merge_size(),
+            cfg.fm_head_out_dim(),
+            cfg.t_eps,
+            cfg.bos_token_id,
+            cfg.add_noise_scale_embedding,
+            cfg.noise_scale_max_value,
+            cfg.noise_scale_base_image_seq_len,
+            cfg.noise_scale,
+        )
+    };
+    let token_p = p * merge;
+    if args.image_hw % token_p != 0 {
+        anyhow::bail!(
+            "--image-hw {} must be divisible by patch_size*merge_size = {token_p}",
+            args.image_hw,
+        );
+    }
+    let h_img = args.image_hw;
+    let w_img = args.image_hw;
+    let grid_h = h_img / p;
+    let grid_w = w_img / p;
+    let token_h = grid_h / merge;
+    let token_w = grid_w / merge;
+    let n_image = token_h * token_w;
+    log::info!(
+        "[train_u1] geometry: HxW={}x{}  grid={}x{}  tokens={}x{}={}  fm_dim={}",
+        h_img,
+        w_img,
+        grid_h,
+        grid_w,
+        token_h,
+        token_w,
+        n_image,
+        fm_dim,
+    );
+
+    // Resolution-dependent noise scale (mirror Python collators.py:256-261):
+    //   eff_noise_scale = min(noise_scale_max, sqrt(N_image / base_seq_len) * noise_scale)
+    // At 256² N=64   → eff=1.0
+    // At 512² N=256  → eff=2.0
+    // At 1024² N=1024 → eff=4.0
+    // At 2048² N=4096 → eff=8.0 (clamped to noise_scale_max)
+    //
+    // Python pre-multiplies eps by this BEFORE z_t = t·x0 + (1-t)·eps, and
+    // also passes the scale to `noise_scale_embedder` (which divides by
+    // noise_scale_max internally). Without this, the model trains on noise
+    // 8× smaller than what inference sees → LoRA fails to generalize.
+    let eff_noise_scale: f32 = if add_ns_embed {
+        let scale = (n_image as f32 / ns_base_seq as f32).sqrt() * ns_value;
+        scale.min(ns_max)
+    } else {
+        1.0
+    };
+    log::info!(
+        "[train_u1] eff_noise_scale={:.4} (N={}, base={}, max={}, value={})",
+        eff_noise_scale,
+        n_image,
+        ns_base_seq,
+        ns_max,
+        ns_value,
+    );
+
+    // ---- Decide mode ----------------------------------------------------
+    let (samples, tokenizer): (Vec<SamplePair>, Option<Tokenizer>) =
+        if let Some(data_dir) = args.data_dir.as_ref() {
+            let samples = scan_dataset(data_dir)?;
+            if samples.is_empty() {
+                anyhow::bail!(
+                    "no <id>.{{jpg|png|webp}} + <id>.txt pairs in {}",
+                    data_dir.display()
+                );
+            }
+            log::info!(
+                "[train_u1] dataset {}: {} samples",
+                data_dir.display(),
+                samples.len(),
+            );
+            let tok = build_tokenizer(&args.model_path)?;
+            (samples, Some(tok))
+        } else {
+            (Vec::new(), None)
+        };
+
+    // ---- Smoke-mode constants (only used when real-data mode is off) ----
+    let smoke_noisy = if samples.is_empty() {
+        Some(gaussian_bf16(args.seed, &[1, 3, h_img, w_img], &device)?)
+    } else {
+        None
+    };
+    let smoke_x0 = if samples.is_empty() {
+        Some(gaussian_bf16(
+            args.seed.wrapping_add(1),
+            &[1, n_image, fm_dim],
+            &device,
+        )?)
+    } else {
+        None
+    };
+    let smoke_input_ids: Vec<i32> = if samples.is_empty() {
+        let bos = bos_id as i32;
+        let mut v = Vec::with_capacity(args.text_len);
+        v.push(bos);
+        for _ in 1..args.text_len {
+            v.push(100i32);
+        }
+        v
+    } else {
+        Vec::new()
+    };
+
+    // ---- Training loop --------------------------------------------------
+    log::info!(
+        "[train_u1] starting {} steps  mode={}",
+        args.steps,
+        if samples.is_empty() {
+            "SMOKE (synthetic)"
+        } else {
+            "DATASET"
+        }
+    );
+    let mut losses: Vec<f32> = Vec::with_capacity(args.steps);
+    let n_samples = samples.len().max(1);
+    let mut accum_count: usize = 0;
+    let tag = if use_lora {
+        "SenseNova-U1-lora"
+    } else {
+        "SenseNova-U1-mvp"
+    };
+    let loop_config =
+        trainer_pipeline::ManualTrainLoopConfig::new(tag, 0, args.steps, n_samples, 1)
+            .with_progress_target(resume_step, args.steps);
+    let mut loop_run = trainer_pipeline::ManualTrainLoopRun::new(loop_config);
+
+    for step in 0..args.steps {
+        // Pick sample (real-data mode) or use the synthetic one.
+        let idx: usize = if samples.is_empty() {
+            0
+        } else if args.shuffle {
+            use rand::{Rng, SeedableRng};
+            let mut rng = rand::rngs::StdRng::seed_from_u64(args.seed.wrapping_add(step as u64));
+            rng.gen_range(0..n_samples)
+        } else {
+            step % n_samples
+        };
+
+        // Build (noisy_pixel_values, x0_patch, eps, input_ids) for this step.
+        // eps is scaled by `eff_noise_scale` BEFORE going into z_t, matching
+        // Python's `collators.py:268-269`.
+        let (noisy_pixel_values_step, x0_patch_step, eps_step, input_ids_step): (
+            Tensor,
+            Tensor,
+            Tensor,
+            Vec<i32>,
+        ) = if samples.is_empty() {
+            let eps_raw = gaussian_bf16(
+                args.seed.wrapping_add(2_000_000 + step as u64),
+                &[1, n_image, fm_dim],
+                &device,
+            )?;
+            let eps_scaled = eps_raw.mul_scalar(eff_noise_scale)?;
+            (
+                smoke_noisy.as_ref().unwrap().clone(),
+                smoke_x0.as_ref().unwrap().clone(),
+                eps_scaled,
+                smoke_input_ids.clone(),
+            )
+        } else {
+            let s = &samples[idx];
+            let img = load_image_x0(&s.image_path, h_img, &device)?;
+            let x0 = sensenova_u1::patchify(&img, token_p, false)?;
+            let eps_raw = gaussian_bf16(
+                args.seed.wrapping_add(2_000_000 + step as u64),
+                &[1, n_image, fm_dim],
+                &device,
+            )?;
+            let eps_scaled = eps_raw.mul_scalar(eff_noise_scale)?;
+            let caption = std::fs::read_to_string(&s.caption_path)
+                .with_context(|| format!("read {}", s.caption_path.display()))?;
+            let query = build_t2i_query(
+                SYSTEM_MESSAGE_FOR_GEN,
+                caption.trim(),
+                "<think>\n\n</think>\n\n<img>",
+            );
+            let ids = encode_query(tokenizer.as_ref().unwrap(), &query)?;
+            (img, x0, eps_scaled, ids)
+        };
+
+        // Compute noisy = unpatchify(z_t) so vision tower sees the noisy-pixel input.
+        // z_t = t * x0 + (1-t) * eps. We do this on CPU-side scalar t for clarity
+        // (one tensor mul + add per step is cheap relative to the 42-layer forward).
+        let t_val: f32 = {
+            use rand::{Rng, SeedableRng};
+            let mut rng =
+                rand::rngs::StdRng::seed_from_u64(args.seed.wrapping_add(3_000_000 + step as u64));
+            rng.gen_range(t_eps..=1.0_f32)
+        };
+        let t_tensor = Tensor::from_vec(vec![t_val], Shape::from_dims(&[1]), device.clone())?
+            .to_dtype(DType::BF16)?;
+
+        // In real-data mode, we want the noisy pixel image (not the clean one)
+        // for extract_feature_gen. Build it by unpatchify(z_t) at p=32.
+        let noisy_pixel_for_gen: Tensor = if samples.is_empty() {
+            noisy_pixel_values_step.clone()
+        } else {
+            let z_t = sensenova_u1::linear_z_t(&x0_patch_step, &eps_step, &t_tensor)?;
+            sensenova_u1::unpatchify(&z_t, token_p, h_img, w_img)?
+        };
+
+        // Pass eff_noise_scale to forward so noise_scale_embedder conditions
+        // on it (matching Python wrapper.py:144-146). forward_t2i_step
+        // internally does `ns / noise_scale_max_value` before the embedder.
+        let noise_scale_tensor: Option<Tensor> = if add_ns_embed {
+            let t = Tensor::from_vec(
+                vec![eff_noise_scale],
+                Shape::from_dims(&[1]),
+                device.clone(),
+            )?
+            .to_dtype(DType::BF16)?;
+            Some(t)
+        } else {
+            None
+        };
+
+        let out = model.forward_t2i_step(
+            &noisy_pixel_for_gen,
+            &x0_patch_step,
+            &eps_step,
+            &t_tensor,
+            grid_h,
+            grid_w,
+            &input_ids_step,
+            noise_scale_tensor.as_ref(),
+            None,
+        )?;
+
+        // Loss: MSE(x_pred, x0) in F32.
+        let pred_f32 = out.x_pred.to_dtype(DType::F32)?;
+        let target_f32 = x0_patch_step.to_dtype(DType::F32)?;
+        let loss = flame_core::loss::mse_loss(&pred_f32, &target_f32)?;
+        let loss_val = loss.to_vec()?[0];
+        losses.push(loss_val);
+
+        // Scale loss for grad accumulation.
+        let loss_scaled = if args.grad_accum > 1 {
+            loss.mul_scalar(1.0 / args.grad_accum as f32)?
+        } else {
+            loss
+        };
+
+        // Phase 5b / gate-on 6a: Route (ii) bridge. v2 is the default; backward
+        // goes through `backward_v2` unless `--use-autograd-v3` opts into v3.
+        let grads = trainer_pipeline::backward_loss(&loss_scaled, args.use_autograd_v3)?;
+
+        // Grad-flow assertion at step 1. Works for ALL optimizers now that
+        // flame-core's `Parameter::set_data` pins `self.id` across in-place
+        // updates (see `flame-core/src/parameter.rs::set_data`). Previously
+        // Adafactor/Lion/Prodigy/StableAdamW/RAdamScheduleFree silently
+        // no-op'd because their post-step Parameter.id drifted out of sync
+        // with the next backward's GradientMap keys.
+        if step == 1 {
+            let named = model.named_parameters();
+            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> =
+                named.iter().map(|(n, p)| (n.as_str(), p)).collect();
+            let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
+            if report.is_clean() {
+                log::info!(
+                    "[train_u1] step 1 grad-flow clean ({} params)",
+                    report.ok_count
+                );
+            } else {
+                log::warn!("[train_u1] grad-flow {}", report.summary());
+            }
+        }
+
+        // Accumulate grads into Parameter.grad. For grad_accum > 1, sum
+        // across micro-steps; otherwise just set.
+        //
+        // NOTE: Only correct for AdamW. Other optimizers in flame-core call
+        // `Parameter::set_data` in `.step()` which replaces the inner Tensor
+        // with one that has a fresh TensorId — but `Parameter.id` field is
+        // NOT updated. After step 0 with those optimizers, every `param.id()`
+        // is stale relative to the next backward's GradientMap keys, so the
+        // `grads.get(...)` below returns None for every param → no set_grad
+        // → no update. Loss looks like it varies but it's purely t-variance.
+        // Until flame-core's Parameter::set_data is patched to refresh
+        // self.id (or those optimizers switched to with_data_mut), AdamW is
+        // the only safe choice for this trainer.
+        for param in &params {
+            if let Some(g) = grads.get(param.id()) {
+                if args.grad_accum > 1 && accum_count > 0 {
+                    // Add to existing
+                    let existing = param.grad();
+                    let new_g = match existing {
+                        Some(prev) => prev.add(g)?,
+                        None => g.clone(),
+                    };
+                    param.set_grad(new_g)?;
+                } else {
+                    param.set_grad(g.clone())?;
+                }
+            }
+        }
+        accum_count += 1;
+
+        // Global L2 grad norm for the progress line (cheap — sums over the
+        // GradientMap entries that match our params).
+        let grad_norm: f32 = {
+            let mut sq_sum: f64 = 0.0;
+            for param in &params {
+                if let Some(g) = grads.get(param.id()) {
+                    let abs2 = g.to_dtype(DType::F32)?.square()?.sum_all()?.to_vec()?[0];
+                    sq_sum += abs2 as f64;
+                }
+            }
+            (sq_sum.sqrt()) as f32
+        };
+
+        let do_step = accum_count >= args.grad_accum;
+        if do_step {
+            trainer_pipeline::step_optimizer(&mut opt, &params, args.lr, || Ok(()))?;
+            accum_count = 0;
+        }
+
+        // Universal progress line (used across EDv2 trainers — see
+        // crates/eridiffusion-core/src/training/progress.rs). Emits
+        // `[<tag>] step N/T | epoch | loss | grad_norm | s/step | elapsed | ETA`.
+        // Step N is the ABSOLUTE step (resume_step + run-local + 1), so a
+        // resumed run reads as e.g. `step 107/500`, not `step 7/400`.
+        loop_run.record_and_log_at(
+            step,
+            trainer_pipeline::TrainStepMetrics {
+                loss_value: loss_val,
+                grad_norm,
+                learning_rate: args.lr,
+            },
+            board.as_ref(),
+        );
+        // t value for diagnostic (loss varies massively with t at single-
+        // step granularity; the rolling mean is the real signal).
+        log::debug!(
+            "[train_u1] step={} t={:.3} loss={:.6} sample={}",
+            resume_step + step + 1,
+            t_val,
+            loss_val,
+            if samples.is_empty() {
+                "synthetic".to_string()
+            } else {
+                samples[idx].sample_id.clone()
+            },
+        );
+
+        // Periodic checkpoint
+        // TODO(u1-ckpt-unfreeze-only): the `&& use_lora` gate skips
+        // checkpointing for pure-unfreeze mode (--unfreeze without --lora-*).
+        // Pre-existing limitation; out of scope of the sidecar fix. To
+        // support, factor the save_to path's `save_file(named_parameters)`
+        // call into a helper and call here too.
+        if args.checkpoint_every > 0
+            && (step + 1) % args.checkpoint_every == 0
+            && do_step
+            && use_lora
+        {
+            let base = args
+                .lora_save_to
+                .as_ref()
+                .or(args.save_to.as_ref())
+                .map(|p| p.clone())
+                .unwrap_or_else(|| PathBuf::from("/tmp/u1_lora.safetensors"));
+            let ckpt = base.with_file_name(format!(
+                "{}.step{:06}.safetensors",
+                base.file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("u1_lora"),
+                step + 1,
+            ));
+            save_lora_checkpoint(&model, &device, &ckpt)?;
+            log::info!("[train_u1] checkpoint → {}", ckpt.display());
+        }
+    }
+
+    let run_secs = loop_run.elapsed_secs_f64() as f32;
+    if losses.len() >= 5 {
+        let first = losses[..5].iter().sum::<f32>() / 5.0;
+        let last = losses[losses.len() - 5..].iter().sum::<f32>() / 5.0;
+        log::info!(
+            "[train_u1] DONE in {:.1}s  mean(loss[:5])={:.6}  mean(loss[-5:])={:.6}  ratio={:.3}",
+            run_secs,
+            first,
+            last,
+            last / first.max(1e-12),
+        );
+    } else {
+        log::info!(
+            "[train_u1] DONE in {:.1}s ({} steps)",
+            run_secs,
+            losses.len()
+        );
+    }
+
+    // ---- Save trainable state ------------------------------------------
+    if use_lora {
+        let lora_path = args.lora_save_to.clone().or_else(|| {
+            args.save_to.as_ref().map(|p| {
+                let mut out = p.clone();
+                let stem = out
+                    .file_stem()
+                    .map(|s| s.to_os_string())
+                    .unwrap_or_default();
+                let mut new_name = stem;
+                new_name.push(".lora.safetensors");
+                out.set_file_name(new_name);
+                out
+            })
+        });
+        if let Some(path) = lora_path.as_ref() {
+            save_lora_checkpoint(&model, &device, path)?;
+            log::info!(
+                "[train_u1] saved {} LoRA adapters (PEFT format) → {}",
+                model.lora_adapters().len(),
+                path.display(),
+            );
+        }
+    } else if let Some(path) = args.save_to.as_ref() {
+        let named = model.named_parameters();
+        let mut tensors: std::collections::HashMap<String, Tensor> =
+            std::collections::HashMap::with_capacity(named.len());
+        for (k, p) in &named {
+            tensors.insert(k.clone(), p.tensor()?);
+        }
+        flame_core::serialization::save_file(&tensors, path)
+            .map_err(|e| anyhow!("save_file {:?}: {e}", path))?;
+        log::info!(
+            "[train_u1] saved {} tensors → {}",
+            tensors.len(),
+            path.display()
+        );
+    }
+
+    trainer_pipeline::mark_board_completed(board.as_ref());
+
+    Ok(())
+}

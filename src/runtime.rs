@@ -12,7 +12,7 @@
 //! command path resolution land alongside the M1 Klein launch.
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -379,12 +379,12 @@ fn write_runner_config(cfg: &TrainConfig) -> Result<String, String> {
 fn edv2_dir() -> PathBuf {
     match std::env::var("ERITRAINER_EDV2_DIR") {
         Ok(d) if !d.trim().is_empty() => PathBuf::from(d),
-        _ => PathBuf::from("/home/alex/EriDiffusion/EriDiffusion-v2"),
+        _ => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("backend/EriDiffusion-v2"),
     }
 }
 
 /// How to launch an EDv2 bin: prefer a prebuilt `target/{release,debug}/<bin>`,
-/// else fall back to `cargo run --release --bin <bin>` against the workspace.
+/// else fall back to `cargo run --bin <bin>` in this app's current profile.
 fn resolve_launcher(bin: &str) -> (String, Vec<String>) {
     let dir = edv2_dir();
     let release = dir.join("target/release").join(bin);
@@ -395,19 +395,23 @@ fn resolve_launcher(bin: &str) -> (String, Vec<String>) {
         (debug.to_string_lossy().into_owned(), Vec::new())
     } else {
         let manifest = dir.join("Cargo.toml");
-        (
-            String::from("cargo"),
-            vec![
-                String::from("run"),
-                String::from("--release"),
-                String::from("--manifest-path"),
-                manifest.to_string_lossy().into_owned(),
-                String::from("--bin"),
-                String::from(bin),
-                String::from("--"),
-            ],
-        )
+        (String::from("cargo"), cargo_run_args(&manifest, bin))
     }
+}
+
+fn cargo_run_args(manifest: &Path, bin: &str) -> Vec<String> {
+    let mut args = vec![String::from("run")];
+    if !cfg!(debug_assertions) {
+        args.push(String::from("--release"));
+    }
+    args.extend([
+        String::from("--manifest-path"),
+        manifest.to_string_lossy().into_owned(),
+        String::from("--bin"),
+        String::from(bin),
+        String::from("--"),
+    ]);
+    args
 }
 
 /// Env for the spawned trainer: libtorch on LD_LIBRARY_PATH (required for the
@@ -441,11 +445,10 @@ fn launch_env(cfg: &TrainConfig) -> Vec<(String, String)> {
     env
 }
 
-/// Build (program, args) for the selected model's trainer. Only Klein is wired
-/// in M1; every other model returns Err so the launch fails loud instead of
-/// spawning a trainer with the wrong argv.
-// --- UNVERIFIED launch wiring for the remaining models (mirrored from each
-//     trainer's clap CLI; NOT yet smoke-tested — see config::model_verified). ---
+/// Build (program, args) for the selected model's trainer through the local
+/// `train --model <id>` dispatcher. All registered trainer IDs map to their
+/// real per-model CLI; `config::model_verified` records which have current
+/// end-to-end smoke evidence.
 
 fn require(path: &str, what: &str) -> Result<(), String> {
     if path.trim().is_empty() {
@@ -655,34 +658,37 @@ fn u1_args(cfg: &TrainConfig) -> Result<Vec<String>, String> {
 }
 
 pub fn build_command(cfg: &TrainConfig) -> Result<(String, Vec<String>), String> {
-    let (bin, args) = match cfg.model_type.as_str() {
-        "ideogram4" => ("train_ideogram", ideogram_args(cfg)?),
-        "klein" => ("train_klein", klein_args(cfg)?),
-        "sdxl" => ("train_sdxl", sdxl_args(cfg)?),
-        "zimage" => ("train_zimage", zimage_args(cfg)?),
-        "chroma" => ("train_chroma", chroma_args(cfg)?),
-        "ernie" => ("train_ernie", ernie_args(cfg)?),
-        "anima" => ("train_anima", anima_args(cfg)?),
+    let args = match cfg.model_type.as_str() {
+        "ideogram4" => ideogram_args(cfg)?,
+        "klein" => klein_args(cfg)?,
+        "sdxl" => sdxl_args(cfg)?,
+        "zimage" => zimage_args(cfg)?,
+        "chroma" => chroma_args(cfg)?,
+        "ernie" => ernie_args(cfg)?,
+        "anima" => anima_args(cfg)?,
         // model_type "hidream" -> bin train_hidream_o1 (name reconciliation).
-        "hidream" => ("train_hidream_o1", hidream_args(cfg)?),
-        "sd35" => ("train_sd35", sd35_args(cfg)?),
-        "l2p" => ("train_l2p", l2p_args(cfg)?),
+        "hidream" => hidream_args(cfg)?,
+        "sd35" => sd35_args(cfg)?,
+        "l2p" => l2p_args(cfg)?,
         // --- UNVERIFIED (wired from the CLI; not smoke-tested) ---
-        "flux" => ("train_flux", flux_args(cfg)?),
-        "qwenimage" => ("train_qwenimage", qwenimage_args(cfg)?),
-        "acestep" => ("train_acestep", acestep_args(cfg)?),
-        "ltx2" => ("train_ltx2", ltx2_args(cfg)?),
-        "slider_klein" => ("train_slider_klein", slider_klein_args(cfg)?),
-        "asymflow" => ("train_asymflow", asymflow_args(cfg)?),
-        "wan22" => ("train_wan22", wan22_args(cfg)?),
-        "u1" => ("train_u1", u1_args(cfg)?),
+        "flux" => flux_args(cfg)?,
+        "qwenimage" => qwenimage_args(cfg)?,
+        "acestep" => acestep_args(cfg)?,
+        "ltx2" => ltx2_args(cfg)?,
+        "slider_klein" => slider_klein_args(cfg)?,
+        "asymflow" => asymflow_args(cfg)?,
+        "wan22" => wan22_args(cfg)?,
+        "u1" => u1_args(cfg)?,
         other => {
             return Err(format!(
-                "launch for model '{other}' is not wired (all 17 train_* are wired; unknown model_type)"
+                "launch for model '{other}' is not wired (18 train_* targets are registered; unknown model_type)"
             ))
         }
     };
-    let (program, mut full) = resolve_launcher(bin);
+    let (program, mut full) = resolve_launcher("train");
+    full.push(String::from("--model"));
+    full.push(cfg.model_type.clone());
+    full.push(String::from("--"));
     full.extend(args);
     full.extend(sample_flags(cfg));
     Ok((program, full))
@@ -1230,6 +1236,18 @@ mod tests {
     use crate::config::Sample;
 
     #[test]
+    fn cargo_fallback_uses_current_profile() {
+        let args = cargo_run_args(Path::new("/tmp/edv2/Cargo.toml"), "train");
+
+        if cfg!(debug_assertions) {
+            assert!(!args.iter().any(|arg| arg == "--release"));
+        } else {
+            assert!(args.iter().any(|arg| arg == "--release"));
+        }
+        assert!(args.iter().any(|arg| arg == "train"));
+    }
+
+    #[test]
     fn parses_full_klein_progress_line() {
         let line = "[klein-lora] step 107/500 | epoch 2/10 | loss 0.0421 | grad_norm 0.1730 | 4.5s/step | elapsed 0:08:01 | ETA 0:29:27";
         let mut s = LiveStats::default();
@@ -1582,11 +1600,26 @@ mod tests {
         // an explicit .safetensors path is used as-is
         cfg.base_model_path = "/m.safetensors".into();
         assert!(ideogram_args(&cfg).unwrap().join(" ").contains("--model /m.safetensors"));
-        // build_command routes ideogram4 -> train_ideogram (bin appears in program or argv)
+        // build_command routes through the unified trainer entrypoint.
         cfg.base_model_path = "/home/alex/.serenity/models/ideogram-4-fp8".into();
         let (program, full) = build_command(&cfg).unwrap();
         let cmd = format!("{program} {}", full.join(" "));
-        assert!(cmd.contains("train_ideogram"), "build_command missing train_ideogram: {cmd}");
+        let direct_train = std::path::Path::new(&program)
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some("train");
+        let cargo_train = program == "cargo"
+            && full
+                .windows(2)
+                .any(|pair| pair[0] == "--bin" && pair[1] == "train");
+        assert!(
+            direct_train || cargo_train,
+            "build_command missing unified train launcher: {cmd}"
+        );
+        assert!(
+            cmd.contains("--model ideogram4"),
+            "build_command missing ideogram model dispatch: {cmd}"
+        );
         // verified + no sample flags
         assert!(crate::config::model_verified("ideogram4"));
         cfg.sample_after = 100.0;
@@ -1846,11 +1879,16 @@ mod tests {
         cfg.cache_dir = "/cache/h".into();
         cfg.base_model_path = "/models/h".into();
         let (program, args) = build_command(&cfg).expect("ok");
-        // resolve_launcher yields EITHER the prebuilt bin path (program) OR
-        // `cargo ... --bin train_hidream_o1` (in args). Accept either.
-        let in_program = program.ends_with("train_hidream_o1");
-        let in_args = args.iter().any(|a| a == "train_hidream_o1");
-        assert!(in_program || in_args, "expected train_hidream_o1 bin: program={program} args={args:?}");
+        // The UI launches the unified trainer; the local registry maps
+        // `hidream` to the `train_hidream_o1` shim inside the backend.
+        let in_program = program.ends_with("train");
+        let has_unified_bin = args.windows(2).any(|w| w == ["--bin", "train"]);
+        let has_model = args.windows(2).any(|w| w == ["--model", "hidream"]);
+        assert!(
+            in_program || has_unified_bin,
+            "expected unified train bin: program={program} args={args:?}"
+        );
+        assert!(has_model, "expected hidream model dispatch: args={args:?}");
     }
 
     #[test]

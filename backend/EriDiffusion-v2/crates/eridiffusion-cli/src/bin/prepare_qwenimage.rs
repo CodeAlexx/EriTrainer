@@ -1,0 +1,321 @@
+//! prepare_qwenimage — image+caption → cached latents+embeddings for
+//! Qwen-Image-2512 LoRA training.
+//!
+//! Patterned after `prepare_zimage.rs` and `prepare_anima.rs`.
+//!
+//! Output per sample (one safetensors file in `--output-dir`,
+//! filename = md5 of `vN|res=...|maxtxt=...|<image_path>` so resolution +
+//! template + cache-version changes invalidate stale caches):
+//!   - latent:         BF16 [1, 16, H/8, W/8]   normalized via VAE
+//!                     `(z - latents_mean) * (1/latents_std)` (per-channel,
+//!                     16-vector from vae/config.json). Matches diffusers
+//!                     `QwenImagePipeline._encode_vae_image` and OneTrainer
+//!                     `QwenModel.scale_latents`.
+//!   - text_embedding: BF16 [1, T_seq, 3584]    Qwen2.5-VL last hidden state.
+//!
+//! Reference for the cache schema:
+//!   `qwenimage-trainer/src/dataset.rs::QwenImageCachedDataset`.
+
+use clap::Parser;
+use eridiffusion_core::encoders::{
+    qwen25vl::{Qwen25VLConfig, Qwen25VLEncoder},
+    wan21_encoder::Wan21VaeEncoder,
+};
+use flame_core::{serialization::save_file, DType, Shape, Tensor};
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+const QWEN_PAD_ID: i32 = 151643;
+const TXT_PAD_LEN_DEFAULT: usize = 512;
+
+/// Qwen-Image canonical prompt template — matches `pipeline_qwenimage.py:
+/// PROMPT_TEMPLATE_ENCODE`. The DiT was trained against text embeddings
+/// produced by this exact template, so caching plain captions produces
+/// out-of-distribution conditioning and wrecks both training and
+/// inference. Keep verbatim.
+const PROMPT_PREFIX: &str =
+    "<|im_start|>system\nDescribe the image by detailing the color, shape, size, \
+     texture, quantity, text, spatial relationships of the objects and background:\
+     <|im_end|>\n<|im_start|>user\n";
+const PROMPT_SUFFIX: &str = "<|im_end|>\n<|im_start|>assistant\n";
+
+/// Number of leading tokens to drop from the encoded hidden state — the
+/// system-prompt portion. Matches Python `PROMPT_TEMPLATE_ENCODE_START_IDX`.
+const DROP_IDX: usize = 34;
+
+#[derive(Parser)]
+struct Args {
+    #[arg(long)]
+    input_dir: PathBuf,
+    #[arg(long)]
+    output_dir: PathBuf,
+    /// `qwen_image_vae.safetensors` — wan21 internal-key format.
+    #[arg(long)]
+    vae_ckpt: PathBuf,
+    /// Directory of Qwen2.5-VL text encoder safetensors shards (the
+    /// `text_encoder/` subdir of `qwen-image-2512`), or a single combined file.
+    #[arg(long)]
+    text_encoder: PathBuf,
+    /// Tokenizer.json at `qwen-image-2512/tokenizer/tokenizer.json`.
+    #[arg(long)]
+    tokenizer_path: PathBuf,
+    #[arg(long, default_value = "512")]
+    resolution: u32,
+    #[arg(long, default_value_t = TXT_PAD_LEN_DEFAULT)]
+    max_text_len: usize,
+    #[arg(long, default_value_t = true)]
+    skip_existing: bool,
+    #[arg(long, default_value_t = 0)]
+    max_samples: usize,
+    /// Image augmentations at prep time. All default-off → byte-identical
+    /// caches. Set `--aug-flip` for 50% horizontal flip; `--aug-brightness`
+    /// and `--aug-contrast` jitter pixel values uniformly. `--aug-seed`
+    /// seeds the per-sample RNG.
+    #[arg(long, default_value_t = false)]
+    aug_flip: bool,
+    #[arg(long, default_value_t = 0.0)]
+    aug_brightness: f32,
+    #[arg(long, default_value_t = 0.0)]
+    aug_contrast: f32,
+    #[arg(long, default_value_t = 0)]
+    aug_seed: u64,
+}
+
+fn main() -> anyhow::Result<()> {
+    // Disable flame_core CUDA alloc pool — see prepare_klein.rs writeup. The
+    // pool retains slabs and grows host RSS by ~1 GB per sample at 512²
+    // with text-encoder forward, OOM-killing a 62 GB box around sample 75.
+    if std::env::var_os("FLAME_ALLOC_POOL").is_none() {
+        // SAFETY: single-threaded at this point.
+        unsafe {
+            std::env::set_var("FLAME_ALLOC_POOL", "0");
+        }
+    }
+    env_logger::init();
+    let args = Args::parse();
+    std::fs::create_dir_all(&args.output_dir)?;
+    flame_core::config::set_default_dtype(DType::BF16);
+    let _no_grad = flame_core::autograd::AutogradContext::no_grad();
+    let device = flame_core::global_cuda_device();
+
+    log::info!("[1/3] Loading Wan21 VAE encoder (qwen_image_vae)...");
+    // Cache stores latents NORMALIZED per-channel via
+    // `vae.encode_image_normalized` → `(z - latents_mean) * (1/latents_std)`.
+    // Sampler un-normalizes before the VAE decode. Matches OT
+    // `QwenModel.scale_latents` + diffusers `QwenImagePipeline`.
+    let vae = Wan21VaeEncoder::from_safetensors(args.vae_ckpt.to_str().unwrap(), &device)?;
+
+    log::info!("[2/3] Loading Qwen2.5-VL-7B text encoder...");
+    let te_weights = load_text_encoder_weights(&args.text_encoder, &device)?;
+    let te_cfg = Qwen25VLEncoder::config_from_weights(&te_weights)?;
+    log::info!(
+        "  config: hidden={} layers={} heads={} kv_heads={} head_dim={} max_seq_len={}",
+        te_cfg.hidden_size,
+        te_cfg.num_layers,
+        te_cfg.num_heads,
+        te_cfg.num_kv_heads,
+        te_cfg.head_dim,
+        te_cfg.max_seq_len,
+    );
+    let te = Qwen25VLEncoder::new(te_weights, te_cfg, device.clone());
+
+    let tokenizer = tokenizers::Tokenizer::from_file(&args.tokenizer_path)
+        .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+
+    log::info!("[3/3] Encoding samples...");
+    let mut pairs = Vec::new();
+    for entry in std::fs::read_dir(&args.input_dir)? {
+        let p = entry?.path();
+        if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
+            if matches!(
+                ext.to_lowercase().as_str(),
+                "jpg" | "jpeg" | "png" | "webp" | "bmp"
+            ) {
+                let stem = p.file_stem().unwrap().to_str().unwrap();
+                pairs.push((p.clone(), args.input_dir.join(format!("{stem}.txt"))));
+            }
+        }
+    }
+    log::info!("Found {} (image, caption) pairs", pairs.len());
+
+    let aug_cfg = eridiffusion_core::training::features::image_aug::AugConfig {
+        flip: args.aug_flip,
+        brightness: args.aug_brightness,
+        contrast: args.aug_contrast,
+    };
+    if aug_cfg.is_active() {
+        log::info!(
+            "[image-aug] flip={} brightness={} contrast={} seed={}",
+            aug_cfg.flip,
+            aug_cfg.brightness,
+            aug_cfg.contrast,
+            args.aug_seed
+        );
+    }
+
+    // Sentinel `_meta.json` records prep settings so the trainer can warn
+    // if the cache dir was produced at a different resolution / max_text_len.
+    let meta = format!(
+        r#"{{"resolution": {}, "max_text_len": {}, "version": 2}}"#,
+        args.resolution, args.max_text_len
+    );
+    let _ = std::fs::write(args.output_dir.join("_meta.json"), &meta);
+
+    let mut written = 0usize;
+    let mut skipped = 0usize;
+    let t_start = std::time::Instant::now();
+
+    for (idx, (img_path, txt_path)) in pairs.iter().enumerate() {
+        if args.max_samples > 0 && written + skipped >= args.max_samples {
+            break;
+        }
+        // NOTE: hash is `md5(image_path)` only — resolution + template are
+        // NOT in the key. Use a per-resolution cache dir (e.g.
+        // `<dataset>_qwen_512/`) to avoid silent OOD-reuse on resolution
+        // changes. A sentinel `_meta.json` (written below) records the
+        // prep settings so the trainer can warn at startup if the cache
+        // dir was produced for a different resolution / template.
+        let hash = format!("{:x}", md5::compute(img_path.to_string_lossy().as_bytes()));
+        let out_path = args.output_dir.join(format!("{hash}.safetensors"));
+        if args.skip_existing && out_path.exists() {
+            skipped += 1;
+            continue;
+        }
+
+        // ── Image → normalized VAE latent ─────────────────────────────────
+        let img = match image::open(img_path) {
+            Ok(i) => i
+                .resize_exact(
+                    args.resolution,
+                    args.resolution,
+                    image::imageops::FilterType::Lanczos3,
+                )
+                .to_rgb32f(),
+            Err(e) => {
+                log::warn!("[{idx}] skipping {}: {e}", img_path.display());
+                continue;
+            }
+        };
+        let mut img = img;
+        if aug_cfg.is_active() {
+            use rand::SeedableRng;
+            let mut aug_rng = rand::rngs::StdRng::seed_from_u64(args.aug_seed ^ idx as u64);
+            eridiffusion_core::training::features::image_aug::apply_augs(
+                &mut img,
+                None,
+                &aug_cfg,
+                &mut aug_rng,
+            );
+        }
+        let (w, h) = img.dimensions();
+        // CHW transpose — see prepare_klein.rs for full bug writeup. image::pixels
+        // (HWC interleaved) reshaped to [1, 3, H, W] (CHW) scrambles channels and
+        // the VAE silently encodes garbage without this manual transpose.
+        let (wu, hu) = (w as usize, h as usize);
+        let mut pixels = vec![0f32; 3 * hu * wu];
+        for (x, y, p) in img.enumerate_pixels() {
+            let (xu, yu) = (x as usize, y as usize);
+            for c in 0..3 {
+                pixels[c * hu * wu + yu * wu + xu] = p.0[c] * 2.0 - 1.0;
+            }
+        }
+        let img_t = Tensor::from_vec(pixels, Shape::from_dims(&[1, 3, hu, wu]), device.clone())?
+            .to_dtype(DType::BF16)?;
+        // [1, 16, H/8, W/8] **normalized** — diffusers QwenImage DiT trains
+        // and predicts in `(z - MEAN) / STD` space. Cache must be in this
+        // space too so the trainer's targets match the DiT's native output
+        // distribution. (Sampler's `decode_image_normalized` un-normalizes
+        // before running VAE convs.)
+        let latent = vae.encode_image_normalized(&img_t)?;
+
+        // ── Caption → Qwen2.5-VL hidden state with PROPER template ───────
+        // Wrap the caption in the qwen-image PROMPT_TEMPLATE_ENCODE, encode,
+        // drop the system-prompt prefix (DROP_IDX tokens), and TRIM trailing
+        // pad-token hidden states. The DiT was trained against variable-
+        // length text embeddings (per-prompt content length), so padding
+        // every prompt to a fixed `max_text_len` pollutes joint attention
+        // with junk pad-token hiddens — the DiT learns to attend to
+        // padding noise. Mirrors inference-flame's
+        // `qwenimage_encode::encode_and_trim` (qwenimage_encode.rs:92-115).
+        let caption = std::fs::read_to_string(txt_path).unwrap_or_default();
+        let caption = caption.trim();
+        if caption.is_empty() {
+            log::warn!(
+                "[{idx}] skipping {}: caption file is empty (would train on the bare PROMPT template)",
+                img_path.display()
+            );
+            skipped += 1;
+            continue;
+        }
+        let wrapped = format!("{PROMPT_PREFIX}{caption}{PROMPT_SUFFIX}");
+        let enc = tokenizer
+            .encode(wrapped, false)
+            .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+        let raw_ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
+        // Pad/truncate to (max_text_len + DROP_IDX). `real_len` is the
+        // pre-pad length (capped at `work_len`); we narrow the encoder
+        // output to `[1, real_len - DROP_IDX, 3584]` so trailing pad
+        // tokens are dropped from the saved cache.
+        let work_len = args.max_text_len + DROP_IDX;
+        let mut ids: Vec<i32> = raw_ids.iter().take(work_len).copied().collect();
+        let real_len_pre_pad = ids.len();
+        ids.resize(work_len, QWEN_PAD_ID);
+        let real_len = real_len_pre_pad.min(work_len);
+        if real_len <= DROP_IDX {
+            anyhow::bail!(
+                "caption tokenized to only {real_len} ids; expected > {DROP_IDX} after PROMPT_TEMPLATE_ENCODE wrap"
+            );
+        }
+        let kept_len = real_len - DROP_IDX;
+        // Encode: [1, work_len, 3584]
+        let full_hidden = te.encode(&ids)?.to_dtype(DType::BF16)?;
+        // Drop system-prompt prefix + trailing pads → [1, kept_len, 3584]
+        let text_hidden = full_hidden.narrow(1, DROP_IDX, kept_len)?;
+
+        let mut tensors: HashMap<String, Tensor> = HashMap::new();
+        tensors.insert("latent".into(), latent.to_dtype(DType::BF16)?);
+        tensors.insert("text_embedding".into(), text_hidden.to_dtype(DType::BF16)?);
+        save_file(&tensors, &out_path)?;
+        written += 1;
+
+        if written % 10 == 0 || written == 1 {
+            let elapsed = t_start.elapsed().as_secs_f32();
+            log::info!(
+                "  cached {written} (skipped {skipped}) — {:.2}/s",
+                written as f32 / elapsed.max(1e-3)
+            );
+        }
+    }
+
+    log::info!(
+        "Done: wrote {written}, skipped {skipped}, total {} in {:.1}s",
+        pairs.len(),
+        t_start.elapsed().as_secs_f32()
+    );
+    let _ = Qwen25VLConfig::default();
+    Ok(())
+}
+
+/// Qwen2.5-VL ships sharded across 4 .safetensors. Load all .safetensors in
+/// the directory; works for a single-file path too.
+fn load_text_encoder_weights(
+    path: &std::path::Path,
+    device: &std::sync::Arc<flame_core::CudaDevice>,
+) -> flame_core::Result<HashMap<String, Tensor>> {
+    if path.is_file() {
+        return flame_core::serialization::load_file(path, device);
+    }
+    let mut all = HashMap::new();
+    for entry in std::fs::read_dir(path)
+        .map_err(|e| flame_core::Error::Io(format!("read_dir {}: {e}", path.display())))?
+    {
+        let p = entry
+            .map_err(|e| flame_core::Error::Io(format!("entry: {e}")))?
+            .path();
+        if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+            let part = flame_core::serialization::load_file(&p, device)?;
+            all.extend(part);
+        }
+    }
+    Ok(all)
+}

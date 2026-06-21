@@ -1,10 +1,15 @@
 /target
+backend/**/target/
+backend/**/output/
+backend/**/cache/
+backend/**/*.safetensors
 **/*.rs.bk
-Cargo.lock
 
-# Dev-note markdown stays local, not in the repo (only README.md tracked)
-*.md
-!README.md
+# Repository docs and lockfiles are part of the trainer handoff. Keep local
+# scratch notes explicitly named instead of ignoring all markdown globally.
+*.local.md
+*.scratch.md
+*.tmp.md
 
 # Training outputs (LoRAs, samples) stay local — never commit
 output/

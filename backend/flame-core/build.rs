@@ -1,0 +1,475 @@
+#[cfg(feature = "cuda")]
+fn main() {
+    use std::env;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+
+    // Generate C header when C API is enabled
+    if env::var("CARGO_FEATURE_CAPI").is_ok() {
+        if let (Ok(crate_dir), Ok(out_dir)) = (env::var("CARGO_MANIFEST_DIR"), env::var("OUT_DIR"))
+        {
+            let out = Path::new(&out_dir).join("flame.h");
+            if let Ok(binding) = cbindgen::Builder::new().with_crate(&crate_dir).generate() {
+                let _ = binding.write_to_file(out);
+            } else {
+                println!("cargo:warning=cbindgen generation failed");
+            }
+        } else {
+            println!("cargo:warning=missing CARGO_MANIFEST_DIR or OUT_DIR for cbindgen");
+        }
+    }
+
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=NVCC");
+    println!("cargo:rerun-if-env-changed=LD_LIBRARY_PATH");
+    println!("cargo:rerun-if-env-changed=FLAME_PT_FLASH_NO_FAST_MATH");
+    println!("cargo:rerun-if-env-changed=FLAME_PT_FLASH_MATCH_TORCH_DEFS");
+    println!("cargo:rerun-if-changed=cuda");
+    println!("cargo:rerun-if-changed=src/cuda");
+
+    let cuda_home = env::var("CUDA_HOME").unwrap_or_else(|_| "/usr/local/cuda".into());
+    let nvcc = env::var("NVCC").unwrap_or_else(|_| format!("{cuda_home}/bin/nvcc"));
+
+    if !Path::new(&nvcc).exists() {
+        panic!(
+            "CUDA GPU required. Set CUDA_HOME=/usr/local/cuda and export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH. NVCC not found at {nvcc}.",
+        );
+    }
+    let cudart = format!("{cuda_home}/lib64/libcudart.so");
+    if !Path::new(&cudart).exists() {
+        panic!(
+            "CUDA GPU required. Set CUDA_HOME=/usr/local/cuda and export LD_LIBRARY_PATH=$CUDA_HOME/lib64:$LD_LIBRARY_PATH. Missing {cudart}.",
+        );
+    }
+
+    // Locate cuDNN. Needed for link-search (so `#[link(name="cudnn")]` resolves),
+    // for -rpath so binaries find libcudnn at runtime, and to pass the include
+    // dir to the cudnn_sdpa.cpp cc::Build below.
+    //
+    // pip's cuDNN wheels ship ONLY versioned `libfoo.so.9` files — no
+    // unversioned `.so` symlinks. A plain `-lcudnn` / `-lcudnn_graph` can't
+    // find those. We build a "stub" directory under OUT_DIR with symlinks
+    // (`libcudnn.so -> libcudnn.so.9`, etc.) and add that dir to the link
+    // search path FIRST so every `-l<name>` resolves without touching the
+    // caller's system.
+    let cudnn_lib_candidates = [
+        "/home/alex/.local/lib/python3.12/site-packages/nvidia/cudnn/lib",
+        "/home/alex/serenity/venv/lib/python3.12/site-packages/nvidia/cudnn/lib",
+        "/home/alex/SimpleTuner/.venv/lib/python3.12/site-packages/nvidia/cudnn/lib",
+        "/home/alex/SimpleTuner/.venv/lib/python3.11/site-packages/nvidia/cudnn/lib",
+        "/home/alex/.serenity/cudnn/lib",
+        "/home/alex/libtorch-cu124/libtorch/lib",
+    ];
+    let mut cudnn_lib: Option<String> = None;
+    let mut cudnn_include: Option<String> = None;
+    for candidate in &cudnn_lib_candidates {
+        if Path::new(candidate).join("libcudnn_graph.so.9").exists() {
+            println!("cargo:rustc-link-search=native={}", candidate);
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{}", candidate);
+            cudnn_lib = Some((*candidate).to_string());
+            // Prefer sibling `include/` next to the discovered `lib/`.
+            let sibling = Path::new(candidate).parent().map(|p| p.join("include"));
+            if let Some(s) = sibling {
+                if s.exists() {
+                    cudnn_include = Some(s.to_string_lossy().into_owned());
+                }
+            }
+            break;
+        }
+    }
+    let cudnn_lib = cudnn_lib.unwrap_or_else(|| {
+        panic!(
+            "cuDNN not found (looked for libcudnn_graph.so.9 in {:?}). Install \
+             nvidia-cudnn-cu12 via pip or add its lib dir to cudnn_lib_candidates.",
+            cudnn_lib_candidates
+        )
+    });
+
+    // Build OUT_DIR/cudnn_stubs/ with unversioned symlinks. We need the
+    // symlinks for `-lcudnn` (via `#[link(name="cudnn")]`) and for
+    // `-lcudnn_graph` below. Doing it here keeps the caller's cuDNN dir
+    // untouched.
+    {
+        let out_dir = env::var("OUT_DIR").expect("OUT_DIR not set");
+        let stub_dir = PathBuf::from(&out_dir).join("cudnn_stubs");
+        std::fs::create_dir_all(&stub_dir).expect("create cudnn stub dir");
+        for (unversioned, versioned) in [
+            ("libcudnn.so", "libcudnn.so.9"),
+            ("libcudnn_graph.so", "libcudnn_graph.so.9"),
+        ] {
+            let link_path = stub_dir.join(unversioned);
+            let target = Path::new(&cudnn_lib).join(versioned);
+            if !target.exists() {
+                panic!(
+                    "cuDNN: expected {} in {} but it is missing",
+                    versioned, cudnn_lib
+                );
+            }
+            // Remove stale symlink if cuDNN dir moved.
+            let _ = std::fs::remove_file(&link_path);
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(&target, &link_path)
+                .unwrap_or_else(|e| panic!("symlink {:?} -> {:?}: {e}", link_path, target));
+        }
+        println!("cargo:rustc-link-search=native={}", stub_dir.display());
+    }
+
+    println!("cargo:warning=CUDA_HOME={cuda_home}");
+    println!("cargo:warning=NVCC path={nvcc}");
+
+    println!("cargo:warning=flame-core: compiling CUDA kernels");
+    let pytorch_flash_src_dir =
+        "/home/alex/pytorch/third_party/flash-attention/csrc/flash_attn/src";
+    let pytorch_flash_csrc_dir = "/home/alex/pytorch/third_party/flash-attention/csrc";
+    let cutlass_include_candidates = [
+        "/home/alex/pytorch/third_party/cutlass/include",
+        "/home/alex/pytorch/third_party/flash-attention/csrc/cutlass/include",
+        "/home/alex/.cache/uv/sdists-v9/pypi/flash-attn/2.8.3/F-aJSrBFOGj56vmnioaki/src/csrc/cutlass/include",
+        "/home/alex/.local/lib/python3.10/site-packages/flashinfer/data/cutlass/include",
+    ];
+    for candidate in cutlass_include_candidates.iter() {
+        println!("cargo:rerun-if-changed={candidate}/cute/tensor.hpp");
+    }
+    let cutlass_include = cutlass_include_candidates
+        .iter()
+        .find(|p| Path::new(p).join("cute/tensor.hpp").exists())
+        .unwrap_or_else(|| {
+            panic!(
+                "CUTLASS/CUTE headers not found for PyTorch FlashAttention HD128 path; looked in {:?}",
+                cutlass_include_candidates
+            )
+        });
+    println!("cargo:warning=flame-core: PyTorch FlashAttention CUTLASS include={cutlass_include}");
+
+    let mut cuda_sources = vec![
+        "cuda/narrow_strided.cu",
+        "cuda/permute0213.cu",
+        "cuda/reduce_sum_bf16.cu",
+        "cuda/gemm_bf16_fp32acc.cu",
+        "cuda/gemm_bf16_cublaslt.cu",
+        "cuda/conv2d_nhwc_bf16.cu",
+        "cuda/sdpa_stream_bf16.cu",
+        "cuda/add_inplace.cu",
+        "cuda/add_same_shape.cu",
+        "cuda/broadcast.cu",
+        "cuda/tile_bc.cu",
+        "cuda/bf16_slice_index.cu",
+        "cuda/bf16_broadcast_repeat.cu",
+        "cuda/repeat_bf16.cu",
+        "cuda/streaming_attn_bf16.cu",
+        "cuda/modulate_affine_bf16.cu",
+        "cuda/gate_mul_bf16.cu",
+        "src/cuda/pinned_host.cu",
+    ];
+
+    // BF16/NHWC CUDA ops surface (new implementation)
+    cuda_sources.push("cuda/cuda_ops_common.cu");
+    cuda_sources.push("cuda/cuda_ops.cu");
+    cuda_sources.push("cuda/src/flame_cuda_common.cu");
+    cuda_sources.push("cuda/src/flame_bf16_utils.cu");
+    cuda_sources.push("cuda/src/flame_nhwc_adapters.cu");
+    cuda_sources.push("cuda/src/flame_conv2d_stub.cu");
+    cuda_sources.push("cuda/src/flame_sdpa_stub.cu");
+    cuda_sources.push("cuda/src/flame_norm_bf16.cu");
+    cuda_sources.push("cuda/upsample_nearest.cu");
+    cuda_sources.push("cuda/upsample_bilinear.cu");
+
+    cuda_sources.push("kernels/adaln_layernorm_bf16.cu");
+    cuda_sources.push("kernels/rope_kernels.cu");
+    cuda_sources.push("kernels/sdpa_kernels.cu");
+    cuda_sources.push("kernels/geglu_kernels.cu");
+    cuda_sources.push("kernels/silu_backward.cu");
+    cuda_sources.push("src/cuda/f32_to_bf16.cu");
+    cuda_sources.push("kernels/swiglu_backward.cu");
+    cuda_sources.push("kernels/qkv_split_backward.cu");
+    cuda_sources.push("kernels/relu_backward.cu");
+    cuda_sources.push("kernels/gelu_backward.cu");
+    cuda_sources.push("kernels/tanh_backward.cu");
+    cuda_sources.push("kernels/sigmoid_backward.cu");
+
+    // Fused inference kernels (flame-swap / LTX-2 perf)
+    cuda_sources.push("src/cuda/fused_rms_norm.cu");
+    cuda_sources.push("src/cuda/fused_modulate.cu");
+    cuda_sources.push("src/cuda/fused_linear3d.cu");
+    cuda_sources.push("src/cuda/flash_attention_fwd.cu");
+    cuda_sources.push("src/cuda/pytorch_flash_attn_hd128_bf16.cu");
+    cuda_sources.push(
+        "/home/alex/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash_fwd_hdim128_bf16_sm80.cu",
+    );
+    cuda_sources.push(
+        "/home/alex/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash_fwd_hdim128_bf16_causal_sm80.cu",
+    );
+    cuda_sources.push(
+        "/home/alex/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash_bwd_hdim128_bf16_sm80.cu",
+    );
+    cuda_sources.push(
+        "/home/alex/pytorch/third_party/flash-attention/csrc/flash_attn/src/flash_bwd_hdim128_bf16_causal_sm80.cu",
+    );
+    // flash_attention_bwd.cu removed in Phase 2c (2026-04-23): training
+    // backward now goes through cuDNN SDPA backward via cudnn_sdpa_bwd.cpp
+    // below, which is 30-50× faster than the decomposed-recompute path the
+    // trainers were actually hitting (the WMMA backward was gated behind the
+    // unused `flash_attn` feature). See HANDOFF_2026-04-23.md §4.
+    cuda_sources.push("src/cuda/fp8_dequant.cu");
+    cuda_sources.push("src/cuda/fp8_quant.cu");
+    // MXFP4 → BF16 dequant for GPT-OSS MoE experts (Lens M2).
+    // 32 FP4 elements share one 8-bit E8M0 exponent scale.
+    cuda_sources.push("src/cuda/mxfp4_dequant.cu");
+    cuda_sources.push("src/cuda/fp16_to_bf16.cu");
+    cuda_sources.push("src/cuda/fused_norm_modulate.cu");
+    cuda_sources.push("src/cuda/fused_residual_gate.cu");
+    cuda_sources.push("src/cuda/fused_dequant_transpose.cu");
+    cuda_sources.push("src/cuda/grouped_mm.cu");
+    cuda_sources.push("src/cuda/fused_gated_scatter_add.cu");
+    // Phase 4: pilot ops on the new dispatch pipeline. Each `.cu` now holds
+    // only a functor + a one-line extern "C" entry calling
+    // `flame::iter::launch_gpu_kernel<NARGS, Op>(meta, Op{}, stream)`.
+    cuda_sources.push("src/cuda/unary/silu.cu");
+    cuda_sources.push("src/cuda/unary/gelu.cu");
+    // gelu_exact: exact-erf BF16 GELU for PyTorch parity (Cosmos-Predict2.5,
+    // 2026-05-21). Same functor scaffolding as gelu.cu; only the math
+    // differs (erff vs tanh-approx).
+    cuda_sources.push("src/cuda/unary/gelu_exact.cu");
+    cuda_sources.push("src/cuda/unary/square.cu");
+    cuda_sources.push("src/cuda/binary/add.cu");
+    // Phase 5b: 5 binary ops + 2 scalar ops. Scalar ops bypass DispatchStub
+    // (scalar captured in functor state; see src/ops/mul_scalar_iter.rs).
+    cuda_sources.push("src/cuda/binary/sub.cu");
+    cuda_sources.push("src/cuda/binary/mul.cu");
+    cuda_sources.push("src/cuda/binary/div.cu");
+    cuda_sources.push("src/cuda/binary/maximum.cu");
+    cuda_sources.push("src/cuda/binary/minimum.cu");
+    cuda_sources.push("src/cuda/binary/mul_scalar.cu");
+    cuda_sources.push("src/cuda/binary/add_scalar.cu");
+    // Phase 6: unary activations.
+    cuda_sources.push("src/cuda/unary/abs.cu");
+    cuda_sources.push("src/cuda/unary/relu.cu");
+    cuda_sources.push("src/cuda/unary/neg.cu");
+    cuda_sources.push("src/cuda/unary/sigmoid.cu");
+    cuda_sources.push("src/cuda/unary/tanh.cu");
+    // Phase 7: transcendentals (f32 opmath inside functor).
+    cuda_sources.push("src/cuda/unary/sqrt.cu");
+    cuda_sources.push("src/cuda/unary/recip.cu");
+    cuda_sources.push("src/cuda/unary/rsqrt.cu");
+    cuda_sources.push("src/cuda/unary/exp.cu");
+    cuda_sources.push("src/cuda/unary/log.cu");
+    // Phase 9: comparison ops. Output dtype is BF16 0.0/1.0 sentinel —
+    // see the doc-comment on `TensorIteratorBase::build_comparison_op`
+    // for why flame-core diverges from PyTorch's kBool output here.
+    cuda_sources.push("src/cuda/cmp/ge.cu");
+    cuda_sources.push("src/cuda/cmp/gt.cu");
+    cuda_sources.push("src/cuda/cmp/le.cu");
+    cuda_sources.push("src/cuda/cmp/lt.cu");
+    cuda_sources.push("src/cuda/cmp/eq.cu");
+    cuda_sources.push("src/cuda/cmp/ne.cu");
+
+    if !cuda_sources.iter().all(|p| Path::new(p).exists()) {
+        panic!("CUDA sources missing; ensure submodules are synced");
+    }
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR not set"));
+
+    // Clean out stale CUDA artifacts before rebuilding. When the archive already
+    // contains objects with hashed names from a previous build, re-adding the
+    // freshly compiled objects leads to duplicate symbol errors. Removing the
+    // old `.o`/`.a` files keeps the archive deterministic.
+    if let Ok(entries) = std::fs::read_dir(&out_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let should_remove = match path.extension().and_then(|s| s.to_str()) {
+                Some("o") => true,
+                Some("a") => path
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(|name| name == "libflame_cuda_kernels.a")
+                    .unwrap_or(false),
+                _ => false,
+            };
+            if should_remove {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+    }
+
+    let mut objects = Vec::new();
+    for src in &cuda_sources {
+        println!("cargo:rerun-if-changed={}", src);
+        let is_pytorch_flash_src = src.contains("flash_fwd_hdim128_bf16")
+            || src.contains("flash_bwd_hdim128_bf16")
+            || src.ends_with("pytorch_flash_attn_hd128_bf16.cu");
+        let obj_path = out_dir
+            .join(Path::new(src).file_name().expect("cuda source filename"))
+            .with_extension("o");
+
+        let mut cmd = Command::new(&nvcc);
+        cmd.arg("-std=c++17")
+            .arg("-O3")
+            .arg("-Xcompiler")
+            .arg("-fPIC")
+            .arg("-rdc=true")
+            .arg("-c")
+            .arg(src)
+            .arg("-o")
+            .arg(&obj_path)
+            .arg("-gencode")
+            .arg("arch=compute_80,code=sm_80")
+            .arg("-gencode")
+            .arg("arch=compute_86,code=sm_86")
+            .arg("-gencode")
+            .arg("arch=compute_89,code=sm_89")
+            .arg(format!("-I{cuda_home}/include"));
+        if !(is_pytorch_flash_src
+            && env::var("FLAME_PT_FLASH_NO_FAST_MATH")
+                .ok()
+                .as_deref()
+                == Some("1"))
+        {
+            cmd.arg("--use_fast_math");
+        }
+        cmd.arg("-I").arg("cuda/include");
+        if src.ends_with("streaming_attn_bf16.cu") {
+            cmd.arg("-Xptxas").arg("-v");
+        }
+        if is_pytorch_flash_src {
+            cmd.arg("--expt-relaxed-constexpr")
+                .arg("--expt-extended-lambda")
+                .arg("-I")
+                .arg("src/cuda/torch_flash_shim")
+                .arg("-I")
+                .arg(pytorch_flash_csrc_dir)
+                .arg("-I")
+                .arg(pytorch_flash_src_dir)
+                .arg("-I")
+                .arg(*cutlass_include)
+                .arg("-DFLASH_NAMESPACE=pytorch_flash")
+                .arg("-DFLASHATTENTION_DISABLE_ALIBI")
+                .arg("-DFLASHATTENTION_DISABLE_SOFTCAP")
+                .arg("-DUNFUSE_FMA")
+                .arg("-U__CUDA_NO_HALF_OPERATORS__")
+                .arg("-U__CUDA_NO_HALF_CONVERSIONS__")
+                .arg("-U__CUDA_NO_HALF2_OPERATORS__")
+                .arg("-U__CUDA_NO_BFLOAT16_CONVERSIONS__");
+            if env::var("FLAME_PT_FLASH_MATCH_TORCH_DEFS")
+                .ok()
+                .as_deref()
+                != Some("1")
+            {
+                cmd.arg("-DFLASHATTENTION_DISABLE_DROPOUT")
+                    .arg("-DFLASHATTENTION_DISABLE_LOCAL")
+                    .arg("-DFLASHATTENTION_DISABLE_UNEVEN_K");
+            }
+        }
+
+        let status = cmd.status().expect("failed to invoke nvcc");
+        if !status.success() {
+            panic!("nvcc failed for {src} with status {status:?}");
+        }
+        objects.push(obj_path);
+    }
+
+    // Device link step
+    let dlink_obj = out_dir.join("flame_cuda_kernels_dlink.o");
+    let mut dlink = Command::new(&nvcc);
+    dlink
+        .arg("-dlink")
+        .arg("-std=c++17")
+        .arg("-O3")
+        .arg("--use_fast_math")
+        .arg("-Xcompiler")
+        .arg("-fPIC")
+        .arg("-rdc=true")
+        .arg("-gencode")
+        .arg("arch=compute_80,code=sm_80")
+        .arg("-gencode")
+        .arg("arch=compute_86,code=sm_86")
+        .arg("-gencode")
+        .arg("arch=compute_89,code=sm_89")
+        .arg(format!("-I{cuda_home}/include"))
+        .arg(format!("-L{cuda_home}/lib64"));
+    for obj in &objects {
+        dlink.arg(obj);
+    }
+    dlink.arg("-o").arg(&dlink_obj);
+    let status = dlink.status().expect("nvcc device link failed");
+    if !status.success() {
+        panic!("nvcc device link failed with {status:?}");
+    }
+    objects.push(dlink_obj);
+
+    // Archive objects into static library
+    let lib_path = out_dir.join("libflame_cuda_kernels.a");
+    let mut ar = Command::new("ar");
+    ar.arg("crus").arg(&lib_path);
+    for obj in &objects {
+        ar.arg(obj);
+    }
+    let status = ar.status().expect("failed to invoke ar");
+    if !status.success() {
+        panic!("ar failed with {status:?}");
+    }
+
+    let cuda_lib = format!("{cuda_home}/lib64");
+    println!("cargo:rustc-link-search=native={cuda_lib}");
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static=flame_cuda_kernels");
+    println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=dylib=cudadevrt");
+    println!("cargo:rustc-link-lib=dylib=cublasLt");
+    println!("cargo:rustc-link-lib=dylib=cublas");
+    println!("cargo:rustc-link-lib=dylib=cuda");
+    println!("cargo:rustc-link-lib=dylib=stdc++");
+
+    println!("cargo:rerun-if-changed=src/ffi/cuda_ffi.c");
+    cc::Build::new()
+        .cpp(true)
+        .file("src/ffi/cuda_ffi.c")
+        .include("cuda/include")
+        .include(format!("{cuda_home}/include"))
+        .flag_if_supported("-std=c++17")
+        .compile("flame_cuda_ffi");
+
+    // ---- cuDNN v9 Flash SDPA host shim ----
+    // Host-only C++17. Does not participate in `-rdc=true` device link above:
+    // pure cuDNN graph API calls from the host, no CUDA __global__ code here.
+    //
+    // `cudnn_sdpa.cpp` holds the inference forward + training-forward entry
+    // points. `cudnn_sdpa_bwd.cpp` holds the backward entry point. They
+    // compile into the same archive.
+    println!("cargo:rerun-if-changed=src/cuda/cudnn_sdpa.cpp");
+    println!("cargo:rerun-if-changed=src/cuda/cudnn_sdpa_bwd.cpp");
+    println!("cargo:rerun-if-changed=third_party/cudnn_frontend/include");
+    let mut sdpa_build = cc::Build::new();
+    sdpa_build
+        .cpp(true)
+        .file("src/cuda/cudnn_sdpa.cpp")
+        .file("src/cuda/cudnn_sdpa_bwd.cpp")
+        .include("third_party/cudnn_frontend/include")
+        .include(format!("{cuda_home}/include"))
+        .flag("-std=c++17")
+        .flag("-O2")
+        // cudnn_frontend headers trigger a lot of narrow warnings that are not
+        // ours to fix; silence them without hiding errors.
+        .flag_if_supported("-Wno-deprecated-declarations")
+        .flag_if_supported("-Wno-unused-parameter")
+        .flag_if_supported("-Wno-unused-variable")
+        .flag_if_supported("-Wno-unused-but-set-variable")
+        .flag_if_supported("-Wno-sign-compare")
+        .flag_if_supported("-Wno-reorder");
+    if let Some(inc) = &cudnn_include {
+        sdpa_build.include(inc);
+    }
+    sdpa_build.compile("flame_cudnn_sdpa");
+
+    // Link the libraries cudnn_frontend touches beyond base `cudnn`.
+    // `cudnn` itself is already linked via `#[link(name="cudnn")]` in
+    // `src/cudnn/handle.rs`.
+    println!("cargo:rustc-link-lib=dylib=cudnn_graph");
+    println!("cargo:rustc-link-lib=dylib=nvrtc");
+}
+
+#[cfg(not(feature = "cuda"))]
+fn main() {
+    panic!(
+        "CUDA feature disabled but required by default. Enable with --features=cuda or use the default build."
+    );
+}

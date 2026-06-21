@@ -1,0 +1,13 @@
+{
+  "__version": 10,
+  "steps": 4,
+  "learning_rate": 1e-4,
+  "lora_rank": 16,
+  "lora_alpha": 16.0,
+  "clip_grad_norm": 1.0,
+  "gradient_checkpointing": "ON",
+  "save_every": 0,
+  "timestep_shift": 1.0,
+  "optimizer": { "name": "adamw" },
+  "sample_every": 0
+}

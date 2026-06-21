@@ -1,0 +1,1939 @@
+//! train_zimage — Z-Image LoRA training binary, mirroring EriDiffusion's released preset.
+//!
+//! Reference: ALL six released `/home/alex/upstream Python/training_presets/#z-image *.json`
+//! (verified 2026-05-04 — LoRA 8GB/16GB, Finetune 16GB/24GB, DeTurbo LoRA 8GB/16GB):
+//!   - timestep_distribution: LOGIT_NORMAL  (NOT sigmoid — earlier note was wrong;
+//!     SIGMOID appears only in `configs/eri2_zimage_base_2500.json` which is a
+//!     personal experiment, not a released preset)
+//!   - noising_weight: 0.0  (TrainConfig default since presets don't override)
+//!   - noising_bias: 0.0
+//!   - timestep_shift: 1.0
+//!   - dynamic_timestep_shifting: false
+//!   - learning_rate: 0.0003
+//!   - resolution: 512
+//!   - training_method: LORA
+//!
+//! Pipeline per step:
+//!   1. Load cached `{latent, text_embedding, text_mask}` (prepared by prepare_zimage).
+//!   2. Sample LOGIT_NORMAL timestep ∈ [0, num_train_timesteps).
+//!   3. sigma = (idx+1)/1000; noisy = noise·sigma + clean·(1-sigma).
+//!   4. Forward → predicted velocity; target = noise - clean (rectified flow).
+//!   5. Loss = mean MSE in F32, with clip_grad_norm=1.0.
+
+use clap::Parser;
+use eridiffusion_cli::{trainer_common, trainer_pipeline};
+use flame_core::{autograd::AutogradContext, DType, Shape, Tensor};
+use std::path::PathBuf;
+
+use eridiffusion_core::config::LrScheduler;
+use eridiffusion_core::encoders::qwen3::Qwen3Encoder;
+use eridiffusion_core::lycoris::{LoraInitType, LycorisAlgo, LycorisBundleConfig};
+use eridiffusion_core::models::zimage::{ZImageLoraBundle, ZImageModel};
+use eridiffusion_core::sampler::zimage_sampler;
+use eridiffusion_core::training::checkpoint;
+use eridiffusion_core::training::ema::ParameterEma;
+use eridiffusion_core::training::features::ema_advanced::EmaConfig;
+use eridiffusion_core::training::features::{
+    loss_weight, lr_schedule, noise_modifiers, sample_library::SampleLibrary, timestep_bias,
+    validation::ValidationLoop,
+};
+use eridiffusion_core::training::training_features::timestep_dist::TimestepConfig;
+use eridiffusion_core::training::training_features::{Optimizer, OptimizerKind};
+use std::sync::{Mutex, OnceLock};
+
+// Process-wide cache for the multi-tensor scale metadata buffer. Used only
+// when `FLAME_MT_SCALE=1` enables the multi-tensor clip-scale path. The
+// per-step buffer is small (2N u64 entries for N LoRA params) and reused
+// across steps once `N` stabilizes. See
+// EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md.
+static MT_SCALE_CACHE: OnceLock<Mutex<flame_core::ops::multi_tensor::MultiTensorMetaCache>> =
+    OnceLock::new();
+
+const ZIMAGE_TEMPLATE_PRE: &str = "<|im_start|>user\n";
+const ZIMAGE_TEMPLATE_POST: &str = "<|im_end|>\n<|im_start|>assistant\n";
+const ZIMAGE_PAD_TOKEN_ID: i32 = 151643;
+const ZIMAGE_TXT_PAD_LEN: usize = 512;
+
+const NUM_TRAIN_TIMESTEPS: usize = 1000;
+const LOGIT_NORMAL_BIAS: f32 = 0.0; // OT TrainConfig default
+const LOGIT_NORMAL_SCALE: f32 = 1.0; // noising_weight + 1.0 = 0.0 + 1.0
+const TIMESTEP_SHIFT_DEFAULT: f32 = 1.0;
+const SEED: u64 = 42;
+// Z-Image VAE scale/shift — must be applied at train time (and inverted at
+// sample time before VAE decode). Pretrained Z-Image DiT was trained on
+// scaled latents per OT BaseZImageSetup.predict() and musubi's zimage train.
+// Caching raw `posterior.mode()` is correct (matches musubi's encode pattern);
+// the (latent-shift)*scale transformation belongs at predict time.
+const ZIMAGE_VAE_SHIFT: f32 = 0.1159;
+const ZIMAGE_VAE_SCALE: f32 = 0.3611;
+
+#[derive(Parser)]
+struct Args {
+    /// Single-file Z-Image transformer safetensors.
+    #[arg(long)]
+    model: PathBuf,
+    #[arg(long)]
+    cache_dir: PathBuf,
+    #[arg(long, default_value = "500")]
+    steps: usize,
+    #[arg(long, default_value = "16")]
+    rank: usize,
+    /// OT TrainConfig default. Earlier `16.0` came from a misread of the
+    /// `alpha=rank` convention — OT presets do NOT override `lora_alpha`,
+    /// so it stays at its TrainConfig default of 1.0 (effective scale =
+    /// alpha/rank = 0.0625). Using alpha=16 made the LoRA branch contribute
+    /// 16× more than OT trains/loads at, miscalibrating gradient magnitudes
+    /// and over-driving the LoRA delta during inference.
+    #[arg(long, default_value = "1.0")]
+    lora_alpha: f32,
+    #[arg(long, default_value = "3e-4")]
+    lr: f32,
+    /// Per-step batch size — N cached samples stacked along dim 0. OT
+    /// Python preset uses batch=2; ED-v2 default 1 keeps single-image flow.
+    #[arg(long, default_value = "1")]
+    batch_size: usize,
+    /// Reserved for future activation-offload pool sizing. As of 2026-05-12
+    /// the pool is NOT installed for Z-Image (see the comment block before
+    /// `let params = model.parameters();` for the empirical reason). The
+    /// flag is preserved so existing config files / CLI invocations remain
+    /// valid when the pool is re-enabled.
+    #[arg(long, default_value = "512")]
+    offload_resolution: usize,
+    /// Save a LoRA checkpoint every N steps WITHOUT rendering an image
+    /// (independent from `--sample-every`). 0 disables. Useful for protecting
+    /// long runs against crashes.
+    #[arg(long, default_value = "0")]
+    save_every: usize,
+    /// Resume from a saved LoRA checkpoint — overwrites the freshly-init
+    /// zeros after model load. Use to continue training (e.g. phase-2 at
+    /// 1024² resuming from phase-1 at 512²). Optimizer state is NOT
+    /// resumed; AdamW restarts fresh, which is fine for fine-tune.
+    #[arg(long, conflicts_with = "resume_full")]
+    resume_lora: Option<PathBuf>,
+    /// Full resume: LoRA weights + AdamW (m, v, t) + step counter. Refuses
+    /// rank/alpha mismatch. `--steps N` is the TARGET total step (loop
+    /// continues from `step` in the ckpt up to N). Use over `--resume-lora`
+    /// for continuous training across stops/restarts.
+    #[arg(long, conflicts_with = "resume_lora")]
+    resume_full: Option<PathBuf>,
+    /// Periodic + final save mode. Default is `full` (LoRA + AdamW state +
+    /// step) so resume is true. `weights` writes legacy weights-only files.
+    #[arg(long, default_value = "full")]
+    save_mode: String,
+    #[arg(long, default_value = "output")]
+    output_dir: PathBuf,
+
+    // ── Periodic save + sample (every N steps) ─────────────────────────
+    #[arg(long, default_value = "0")]
+    sample_every: usize,
+    #[arg(long, default_value = "")]
+    sample_prompt: String,
+    /// Newline-separated file of additional prompts. When set, every sample
+    /// event (baseline at step 0, periodic --sample-every, and final) renders
+    /// ALL prompts in the file. Output filenames carry a per-prompt suffix:
+    /// `sample_step{N}_p{idx}.png`. The `--sample-prompt` single-string is
+    /// appended at the head of the list if non-empty.
+    #[arg(long)]
+    sample_prompts_file: Option<PathBuf>,
+    #[arg(long, default_value = "")]
+    sample_neg_prompt: String,
+    /// LDM Z-Image VAE safetensors (e.g. qwen_image_vae.safetensors).
+    #[arg(long)]
+    sample_vae: Option<PathBuf>,
+    /// Qwen3 4B weights for prompt encoding.
+    #[arg(long)]
+    sample_qwen3: Option<PathBuf>,
+    /// Tokenizer.json from Z-Image base.
+    #[arg(long)]
+    sample_tokenizer: Option<PathBuf>,
+    #[arg(long, default_value = "1024")]
+    sample_size: usize,
+    #[arg(long, default_value = "20")]
+    sample_steps: usize,
+    #[arg(long, default_value = "4.0")]
+    sample_cfg: f32,
+    #[arg(long, default_value = "3.0")]
+    sample_shift: f32,
+    #[arg(long, default_value = "42")]
+    sample_seed: u64,
+
+    // ── Phase 0 multi-feature rollout (default-off; Phase 1+ will consume) ──
+    #[arg(long)]
+    min_snr_gamma: Option<f32>,
+    #[arg(long, default_value_t = 0.0)]
+    caption_dropout_probability: f32,
+    #[arg(long, default_value_t = 1.0)]
+    noise_offset_probability: f32,
+    #[arg(long, default_value_t = 0.0)]
+    gamma_input_perturbation: f32,
+    #[arg(long, default_value_t = 0.0)]
+    huber_strength: f32,
+    #[arg(long, default_value_t = 0.0)]
+    lr_min_factor: f32,
+    #[arg(long)]
+    validation_dataset_dir: Option<PathBuf>,
+    #[arg(long, default_value_t = 0)]
+    validation_every_steps: u64,
+    #[arg(long, num_args = 0..)]
+    multi_backend_weights: Vec<f32>,
+    /// Phase 2: paired with --multi-backend-weights. Klein-only wiring; other
+    /// trainers accept-and-warn until per-model wiring lands.
+    #[arg(long, num_args = 0..)]
+    multi_backend_cache_dirs: Vec<std::path::PathBuf>,
+    /// Phase 2: validation prompt library JSON (Klein-only wiring; other
+    /// trainers accept-and-warn).
+    #[arg(long)]
+    validation_prompts_file: Option<std::path::PathBuf>,
+    #[arg(long, default_value_t = 0.0)]
+    masked_loss_weight: f32,
+    /// Master switch for EMA shadow. See train_klein.rs for full doc.
+    /// Default off → byte-identical to pre-flag commits.
+    #[arg(long, default_value_t = false)]
+    ema: bool,
+    #[arg(long, default_value_t = 1.0)]
+    ema_inv_gamma: f32,
+    #[arg(long, default_value_t = 0.6667)]
+    ema_power: f32,
+    #[arg(long, default_value_t = 0)]
+    ema_update_after_step: u64,
+    #[arg(long, default_value_t = 0.0)]
+    ema_min_decay: f32,
+    #[arg(long, default_value_t = 0.9999)]
+    ema_max_decay: f32,
+    /// Swap shadow → live params at sample/save time.
+    #[arg(long, default_value_t = false)]
+    ema_validation_swap: bool,
+    /// Pyramid / multi-resolution noise: number of additional resolution
+    /// levels to mix into the per-step training noise. `0` (default) is a
+    /// no-op — byte-identical to no-multires.
+    #[arg(long, default_value_t = 0)]
+    multires_noise_iterations: usize,
+    /// Per-level discount factor for `--multires-noise-iterations`.
+    #[arg(long, default_value_t = 0.3)]
+    multires_noise_discount: f32,
+    /// Multi-distribution timestep bias strategy. `none` is byte-identical.
+    #[arg(long, default_value = "none")]
+    timestep_bias_strategy: String,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_multiplier: f32,
+    #[arg(long, default_value_t = 0.0)]
+    timestep_bias_range_min: f32,
+    #[arg(long, default_value_t = 1.0)]
+    timestep_bias_range_max: f32,
+    /// Timestep distribution. `logit_normal` (default — Z-Image preset),
+    /// `uniform`, `sigmoid`, `heavy_tail`, `cos_map`, `inverted_parabola`.
+    #[arg(long, default_value = "logit_normal")]
+    timestep_distribution: String,
+    /// SD3-style flow-matching timestep shift applied AFTER the
+    /// distribution sample: `t' = shift*t / ((shift-1)*t + 1)`.
+    /// `1.0` (default) is the identity (no shift). OneTrainer's Z-Image
+    /// preset uses `1.8` for 512² resolution.
+    #[arg(long, default_value_t = 1.0)]
+    timestep_shift: f32,
+    /// Distribution-specific weight knob (default 0.0 — Z-Image preset).
+    #[arg(long, default_value_t = 0.0)]
+    noising_weight: f32,
+    /// Distribution-specific bias knob (default 0.0 — Z-Image preset).
+    #[arg(long, default_value_t = 0.0)]
+    noising_bias: f32,
+    #[arg(long)]
+    tread_route_pattern: Option<String>,
+    /// Phase 1: optimizer family CLI surface; non-AdamW selection logs a
+    /// warning and falls back to AdamW (full dispatch in Phase 5).
+    #[arg(long, default_value = "adamw")]
+    optimizer: String,
+
+    // ── Phase 6 multi-feature rollout (plumb-only; multi-backend wired in Klein) ──
+    #[arg(long, num_args = 0..)]
+    multi_backend_repeats: Vec<u32>,
+    #[arg(long, default_value_t = false)]
+    caption_tag_shuffle: bool,
+    #[arg(long, default_value_t = false)]
+    cache_clear_each_epoch: bool,
+    #[arg(long, default_value_t = false)]
+    cache_invalidate: bool,
+    /// Phase 5: LR scheduler family. Default `constant` + `warmup_steps=0` is
+    /// byte-equivalent to the prior fixed-LR behaviour.
+    /// Accepted: constant, linear, cosine, cosine_with_restarts, polynomial, rex.
+    #[arg(long, default_value = "constant")]
+    lr_scheduler: String,
+    /// Phase 5: linear LR warmup steps. Default 0 keeps prior behaviour.
+    #[arg(long, default_value_t = 0)]
+    warmup_steps: usize,
+    /// Phase 5: cosine-with-restarts cycle count. Ignored for other schedulers.
+    #[arg(long, default_value_t = 1.0)]
+    lr_cycles: f32,
+
+    // ── LyCORIS algo selection (Phase 2b) ──
+    //
+    // `--algo lora` (default) keeps the legacy `LoRALinear` path — byte-identical
+    // training to pre-Phase-2b. Other values select LyCORIS algos via
+    // `ZImageLoraBundle::new_with_config`. `lora_alpha` and `rank` are shared
+    // with the legacy CLI flags above (no separate `--lycoris-rank`).
+    /// LyCORIS algo: `lora` (default, legacy path) | `locon` | `loha` | `lokr`
+    /// | `full` | `oft`. `full` and `oft` build successfully but their
+    /// `forward_delta` will error inside the zimage forward pass —
+    /// zimage's `base + delta_on_input` call pattern is incompatible with
+    /// Full/OFT semantics. Phase 2c will wire a `merge_into_base` path.
+    #[arg(long, default_value = "lora")]
+    algo: String,
+    /// LoKr Kronecker split factor (ignored for non-LoKr).
+    #[arg(long, default_value_t = 16)]
+    lokr_factor: i32,
+    /// OFT block size (ignored for non-OFT).
+    #[arg(long, default_value_t = 32)]
+    oft_block_size: usize,
+    /// OFT Cayley-Neumann series term count (ignored for non-OFT).
+    #[arg(long, default_value_t = 5)]
+    oft_neumann_terms: usize,
+    /// LoCon / LoHa / LoKr conv variant — Tucker decomposition for non-1×1
+    /// kernels. Z-Image is linear-only so this is currently a no-op.
+    #[arg(long, default_value_t = false)]
+    use_tucker: bool,
+    /// LoKr only: factorize both W1 *and* W2 (default false: only W2).
+    #[arg(long, default_value_t = false)]
+    decompose_both: bool,
+    /// Enable DoRA (weight-decomposed LoRA). Applies to LoCon/LoHa/LoKr/Full
+    /// (OFT errors).
+    ///
+    /// Phase 2b limitation: zimage's bundle ctor doesn't have access to the
+    /// resident block weights at construction time, so DoRA's magnitude is
+    /// initialized from `||I||_2 = 1` rather than `||W_orig||_2`. The trainer
+    /// should still converge but will spend the first few hundred steps
+    /// adjusting the magnitude. Phase 2c will wire pre-load magnitude init.
+    #[arg(long, default_value_t = false)]
+    dora: bool,
+    /// DoRA magnitude axis. Default `true` matches lycoris-upstream
+    /// (norm over input dims, magnitude shape `[out, 1]`).
+    #[arg(long, default_value_t = true)]
+    dora_wd_on_out: bool,
+    #[arg(long, default_value_t = 1e-6)]
+    dora_eps: f32,
+    /// PEFT/SimpleTuner `--lora_init_type`. Applies to LoCon (the LoRA path)
+    /// only. Choices: `default | gaussian | pissa | olora | loftq`. The
+    /// PISSA/OLoRA/LoftQ variants parse but error at adapter construction
+    /// because flame-core does not yet expose SVD/QR.
+    #[arg(long, default_value = "default")]
+    lora_init_type: String,
+    /// SimpleTuner-style `lycoris_config preset.json`. Optional; when set,
+    /// the file's top-level fields overlay the bundle defaults and its
+    /// `apply_preset.module_algo_map` overrides apply per-target during
+    /// adapter construction.
+    #[arg(long)]
+    lycoris_config: Option<PathBuf>,
+    /// SimpleTuner-parity: perturbed-normal LoKr init. Scale `>0` triggers
+    /// `lokr_w1=1, lokr_w2 ~ N(μ_W, σ_W)·scale`. No-op when algo != lokr or
+    /// value is 0.0.
+    #[arg(long, default_value_t = 0.0)]
+    init_lokr_norm: f32,
+    /// SimpleTuner / edv2-reference `network.conv` — per-LyCORIS rank for
+    /// CONV-layer targets (separate from linear `--rank`). `0` (default)
+    /// = fall back to linear rank. Inert when no conv targets are wired
+    /// in the model bundle (current state on all EDv2 trainers).
+    #[arg(long, default_value_t = 0)]
+    conv_rank: usize,
+    /// SimpleTuner / edv2-reference `network.conv_alpha` — alpha for CONV
+    /// targets. `0.0` (default) = fall back to linear `--lora-alpha`.
+    #[arg(long, default_value_t = 0.0)]
+    conv_alpha: f32,
+    /// Per-element dropout on the adapter delta (training only). Reserved for
+    /// Phase 2c wiring on adapter forward; currently accepted-but-unused.
+    #[arg(long, default_value_t = 0.0)]
+    lora_dropout: f32,
+    /// Per-rank Bernoulli on the down-projection intermediate. Phase 2c.
+    #[arg(long, default_value_t = 0.0)]
+    rank_dropout: f32,
+    /// Per-step Bernoulli on the entire adapter. Phase 2c.
+    #[arg(long, default_value_t = 0.0)]
+    module_dropout: f32,
+    /// Rescale rank-mask by `1/mean(mask)` to preserve expectation. Phase 2c.
+    #[arg(long, default_value_t = false)]
+    rank_dropout_scale: bool,
+
+    // ── Phase 5b: autograd v2 bridge opt-in ────────────────────────────────
+    /// Phase 5b (autograd v2 Route ii). When set, the backward pass goes
+    /// through `AutogradContext::backward_v2`, which constructs a
+    /// `GradientMap` under the `MatchInsertedDtype` policy and casts each
+    /// emitted gradient to the loss tensor's dtype (BF16 end-to-end) at
+    /// grad-map-write time. The v3 op dispatch is unchanged — this flag
+    /// only flips the grad-storage policy on the returned map.
+    ///
+    /// Default OFF preserves byte-equivalent v3 behavior. When ON, the
+    /// existing `param.set_grad(...)` (CastToF32 policy on `Parameter::new`)
+    /// converts BF16 grads back to F32 before the AdamW step, so the
+    /// optimizer surface is unaffected. The `FLAME_MT_SCALE` fast-path
+    /// asserts F32 grads; under v2 it is skipped (the default per-param
+    /// `mul_scalar` loop runs instead).
+    ///
+    /// See `flame-core/docs/BF16_GRAD_DECISION.md` and
+    /// `flame-core/docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md` §Phase 5
+    /// Deliverable C Route (ii).
+    #[arg(long, default_value_t = false)]
+    use_autograd_v2: bool,
+
+    /// Opt OUT of autograd v2 and run the legacy v3 engine. v2 is the Z-Image
+    /// default as of 2026-05-30 (gate-on Stage 6a — a 150-step v2-vs-v3 smoke
+    /// matched within 0.02%); v3 is kept available indefinitely as the
+    /// reference engine. `--use-autograd-v2` remains accepted as a back-compat
+    /// no-op.
+    #[arg(long, default_value_t = false, conflicts_with = "use_autograd_v2")]
+    use_autograd_v3: bool,
+
+    /// Same-batch parity probe (HANDOFF_2026-05-24 next-action). When set,
+    /// override step 0's (latent, latent_noise, scaled_noisy_latent_image,
+    /// timestep, sigma, flow_target, text_encoder_output) with values
+    /// loaded from this safetensors file (produced by OT's
+    /// OT_DUMP_STEP1_INPUTS=1 in BaseZImageSetup.predict). Forces a
+    /// per-LoRA grad dump at step 0 and EXITS after the dump (before any
+    /// optimizer step). The dumped grads can be compared directly to
+    /// OT's QKV-DUMP for the same input batch — any divergence is in
+    /// our real-model forward path, not in RNG / data sampling.
+    #[arg(long)]
+    replay_from: Option<PathBuf>,
+    /// Optional OT-compatible JSON TrainConfig. When provided, reads
+    /// `mse_strength`, `mae_strength`, and `loss_weight_fn` from the JSON,
+    /// matching the LossScaler path in OT's _flow_matching_losses
+    /// (ModelSetupDiffusionLossMixin.py:150,155). Defaults match OT values
+    /// (mse=1.0, mae=0.0, loss_weight_fn=CONSTANT) so existing CLI
+    /// invocations without --config are byte-identical.
+    #[arg(long)]
+    config: Option<PathBuf>,
+}
+
+/// LOGIT_NORMAL timestep sample matching OT _get_timestep_discrete.
+/// Superseded by the unified `TimestepConfig` dispatch — kept for reference.
+#[allow(dead_code)]
+fn sample_timestep_logit_normal(rng: &mut rand::rngs::StdRng) -> f32 {
+    trainer_common::sample_logit_normal_timestep(
+        rng,
+        NUM_TRAIN_TIMESTEPS,
+        LOGIT_NORMAL_BIAS,
+        LOGIT_NORMAL_SCALE,
+        TIMESTEP_SHIFT_DEFAULT,
+        0.0,
+        1.0,
+    )
+}
+
+/// Build the unified `TimestepConfig` from CLI args.
+fn build_timestep_config(
+    distribution: &str,
+    weight: f32,
+    bias: f32,
+) -> anyhow::Result<TimestepConfig> {
+    trainer_common::build_full_strength_timestep_config(distribution, weight, bias)
+}
+
+fn main() -> anyhow::Result<()> {
+    use rand::SeedableRng;
+    trainer_common::init_logging();
+    let args = Args::parse();
+    // Phase 2: Klein-only wiring of multi-backend + validation prompts library.
+    // Other trainers accept-and-warn so configs/launchers aren't broken; full
+    // wiring is a follow-up after the per-model encoder + sample paths are
+    // consolidated.
+    trainer_common::warn_unsupported_multi_backend_flags(
+        &args.multi_backend_cache_dirs,
+        &args.multi_backend_weights,
+    );
+    // `--validation-prompts-file` (CLI) OR config.validation_prompts_file is
+    // resolved into the periodic-sample prompt set below (SampleLibrary).
+    if args.masked_loss_weight > 0.0 {
+        log::warn!(
+            "[masked-loss] --masked-loss-weight={:.3} requested but Z-Image's prepare_zimage cache schema has no `latent_mask` field; flag is a no-op for this trainer.",
+            args.masked_loss_weight
+        );
+    }
+    trainer_common::ensure_output_dir(&args.output_dir)?;
+
+    // Load optional TrainConfig JSON for mse_strength / mae_strength / loss_weight_fn.
+    // OT parity: BaseZImageSetup reads these via ModelSetupDiffusionLossMixin.py:150,155.
+    // Defaults (mse=1.0, mae=0.0, loss_weight_fn=Constant) match OT's TrainConfig defaults
+    // so existing CLI invocations without --config remain byte-identical.
+    let train_config = trainer_common::load_train_config_or_default(args.config.as_deref())?;
+    if args.config.is_some() {
+        log::info!(
+            "[config] mse_strength={} mae_strength={} loss_weight_fn={:?}",
+            train_config.mse_strength,
+            train_config.mae_strength,
+            train_config.loss_weight_fn
+        );
+    }
+
+    let device = trainer_common::init_bf16_cuda();
+
+    // Phase 2b: parse the LyCORIS algo selector. `lora` (default) keeps the
+    // legacy `LoRALinear` bundle constructed inside `ZImageModel::load`.
+    // Anything else swaps the bundle in-place after model construction so we
+    // don't have to re-plumb the per-trainer constructor signatures.
+    //
+    // NOTE: `LycorisAlgo::parse("lora")` aliases to `LycorisAlgo::LoCon`
+    // (since LoCon-Linear is the canonical LoRA decomposition). For zimage
+    // we need to distinguish LEGACY plain `LoRALinear` (byte-identical) from
+    // the new `LycorisAdapter::LoCon` path, so re-map `"lora"` → `None` here
+    // explicitly. Users who want the new LoCon path pass `--algo locon`.
+    let algo_str = args.algo.trim().to_ascii_lowercase();
+    let algo = if algo_str == "lora" || algo_str == "none" || algo_str.is_empty() {
+        LycorisAlgo::None
+    } else {
+        LycorisAlgo::parse(&args.algo).map_err(|e| anyhow::anyhow!("--algo: {e}"))?
+    };
+    // Default storage (F32) inherited from `LycorisBundleConfig::default()`.
+    // Z-Image trainer is BF16/F32-only (see feedback_zimage_no_quantization);
+    // do NOT switch storage to FP8/Int8 here.
+    let lyc_config = LycorisBundleConfig {
+        algo,
+        rank: args.rank,
+        alpha: args.lora_alpha as f32,
+        factor: args.lokr_factor,
+        conv_rank: args.conv_rank,
+        conv_alpha: args.conv_alpha,
+        block_size: args.oft_block_size,
+        neumann_terms: args.oft_neumann_terms,
+        use_tucker: args.use_tucker,
+        decompose_both: args.decompose_both,
+        use_scalar: false,
+        dora: args.dora,
+        dora_wd_on_out: args.dora_wd_on_out,
+        dora_eps: args.dora_eps,
+        init_type: LoraInitType::parse(&args.lora_init_type)
+            .map_err(|e| anyhow::anyhow!("--lora_init_type: {e}"))?,
+        ..LycorisBundleConfig::default()
+    };
+    let lyc_config =
+        lyc_config.with_optional_lycoris_config_file(args.lycoris_config.as_deref())?;
+    // Phase 2b dropout-quad flags are accepted-but-unused for now (Phase 2c
+    // will wire them through `LycorisLinear::forward_delta`). Surface a
+    // warning so users don't think they're already active.
+    if args.lora_dropout > 0.0
+        || args.rank_dropout > 0.0
+        || args.module_dropout > 0.0
+        || args.rank_dropout_scale
+    {
+        log::warn!(
+            "[zimage] dropout flags accepted but not yet wired (Phase 2c): \
+             lora_dropout={} rank_dropout={} module_dropout={} rank_dropout_scale={}",
+            args.lora_dropout,
+            args.rank_dropout,
+            args.module_dropout,
+            args.rank_dropout_scale,
+        );
+    }
+
+    log::info!(
+        "Loading Z-Image transformer (rank={} alpha={})...",
+        args.rank,
+        args.lora_alpha
+    );
+    let mut model = ZImageModel::load(
+        &args.model,
+        args.rank,
+        args.lora_alpha,
+        device.clone(),
+        SEED,
+    )?;
+
+    // Phase 2b: if a non-legacy algo was requested, swap the bundle. Plain
+    // `--algo lora` (or `lora`/`none`) keeps the legacy bundle as-is so this
+    // branch is byte-equivalent to the pre-Phase-2b pipeline.
+    if algo != LycorisAlgo::None {
+        log::info!(
+            "[zimage] LyCORIS algo='{}' rank={} alpha={} factor={} block_size={} dora={}",
+            algo.as_str(),
+            lyc_config.rank,
+            lyc_config.alpha,
+            lyc_config.factor,
+            lyc_config.block_size,
+            lyc_config.dora,
+        );
+        if matches!(algo, LycorisAlgo::Full | LycorisAlgo::Oft) {
+            log::warn!(
+                "[zimage] algo='{}' selected — bundle construction will succeed, but \
+                 forward_delta will error inside zimage's `base + delta_on_input` call \
+                 pattern. Phase 2c will wire merge-into-base for these algos.",
+                algo.as_str()
+            );
+        }
+        let new_bundle = ZImageLoraBundle::new_with_config(&lyc_config, device.clone(), SEED)
+            .map_err(|e| anyhow::anyhow!("LyCORIS bundle construction: {e}"))?;
+        model.bundle = new_bundle;
+
+        // SimpleTuner-style perturbed-normal init for LoKr. Breaks the
+        // LoKr dead-leaf (default init zeros `w2_b` → only w2_b receives
+        // grad → catastrophic with ScheduleFree). With `--init-lokr-norm`
+        // both factors are seeded with small noise so every leaf trains
+        // from step 1.
+        if matches!(algo, LycorisAlgo::LoKr) && args.init_lokr_norm > 0.0 {
+            let skipped = model
+                .bundle
+                .apply_init_perturbed_normal(model.block_weights(), args.init_lokr_norm)
+                .map_err(|e| anyhow::anyhow!("init_lokr_norm: {e}"))?;
+            log::info!(
+                "[zimage] --init-lokr-norm={} applied (skipped={} non-LoKr/missing)",
+                args.init_lokr_norm,
+                skipped,
+            );
+        }
+    } else {
+        log::info!("[zimage] algo='lora' (legacy LoRALinear path, byte-identical)");
+    }
+
+    if let Some(resume_path) = args.resume_lora.as_ref() {
+        log::info!(
+            "Resuming LoRA weights only (no optimizer state) from {}",
+            resume_path.display()
+        );
+        model.bundle.load(resume_path, &device)?;
+        model.refresh_lora_cache();
+    }
+
+    // ── Activation offload pool ─────────────────────────────────────────────
+    // INTENTIONALLY NOT INSTALLED for Z-Image as of 2026-05-12. The migration
+    // of `zimage.rs:1054` from `checkpoint` to `checkpoint_offload` (Stage 1
+    // of plan `keen-crafting-jellyfish`) is byte-equivalent without a pool —
+    // `checkpoint_offload` falls back to `checkpoint()` when no pool is
+    // installed (autograd.rs:1876-1879).
+    //
+    // Empirical finding from the same session: Z-Image's per-block sub-tape
+    // has ~21 BF16 grad-required saves per tape entry × ~13 entries per
+    // block × 30 blocks ≈ 8000 push attempts per forward. At 38 MB/slot
+    // (raw BF16 @ 512²) this needs ~300 GB pinned host RAM, which is 5×
+    // the 62 GB system budget. Pool sizing experiments (slots_per_block=8
+    // → 32) all hit pool exhaustion in the first block, triggering partial
+    // offload + recompute fallback that runs 2-3× SLOWER than pure
+    // recompute (5.9 s/step vs 1.8 s baseline) AND triggered both NaN loss
+    // and CUDA OOM in backward. Pool install is therefore actively harmful.
+    //
+    // To revisit: would need either (a) per-block pool slot reservation
+    // with eviction (flame-core change), (b) sparse-save model rewrite, or
+    // (c) selectively offloading only "expensive" saves (heuristic in
+    // flame-core). All are out of scope for Stage 1.
+    //
+    // The migration alone is kept because it is a strict no-op without a
+    // pool, and enables future re-enable without a model code change.
+    //
+    // Chroma hits the same failure mode at smaller numbers (see
+    // train_chroma.rs) — pool install is currently not productive for any
+    // EDv2 trainer until flame-core fixes the partial-offload path.
+    let _ = args.offload_resolution; // arg accepted for forward-compatibility
+
+    let mut params = model.parameters();
+    log::info!("Loaded {} trainable LoRA tensors", params.len());
+    if params.is_empty() {
+        anyhow::bail!("No trainable parameters — ZImageModel produced empty param list");
+    }
+
+    // Phase 5d item #2: when `--use-autograd-v2` is on, flip every trainable
+    // LoRA Parameter to `MatchParamDtype` so the BF16 grads coming out of the
+    // bridge stay BF16 in `param.set_grad` (instead of being upcast to F32 by
+    // the default `CastToF32` policy on `Parameter::new`). `Parameter` is
+    // `Clone` but its `grad_dtype_policy` field is per-instance (data and
+    // grad are Arc<Mutex<...>>, shared) — so mutating the trainer-owned `params`
+    // Vec is sufficient. AdamW dispatch reads each param's policy at step time.
+    trainer_pipeline::apply_autograd_v2_grad_policy(&mut params, args.use_autograd_v3, "params");
+
+    let opt_kind =
+        OptimizerKind::parse(&args.optimizer).map_err(|e| anyhow::anyhow!("--optimizer: {e}"))?;
+    if matches!(opt_kind, OptimizerKind::AdamW8bit) {
+        anyhow::bail!(
+            "AdamW8bit is forbidden for Z-Image (no-quantization rule per \
+             `feedback_zimage_no_quantization.md`). Use `--optimizer adamw` or another non-quantized optimizer."
+        );
+    }
+    log::info!("[Z-Image] optimizer={}", opt_kind.as_str());
+    let mut opt = Optimizer::new(opt_kind, args.lr, 0.9, 0.999, 1e-8, 0.01);
+
+    // EMA shadow (Phase 3). See train_klein.rs for the same pattern.
+    let ema_cfg = EmaConfig {
+        inv_gamma: args.ema_inv_gamma,
+        power: args.ema_power,
+        update_after_step: args.ema_update_after_step,
+        min_decay: args.ema_min_decay,
+        max_decay: args.ema_max_decay,
+    };
+    let mut ema: Option<ParameterEma> = if args.ema {
+        let _g = AutogradContext::no_grad();
+        let e = ParameterEma::new(&params, args.ema_max_decay)
+            .map_err(|e| anyhow::anyhow!("EMA construction failed: {e}"))?;
+        log::info!(
+            "[ema] WIRED — {} shadow tensors, swap={}",
+            e.len(),
+            args.ema_validation_swap
+        );
+        Some(e)
+    } else {
+        None
+    };
+
+    // Timestep bias config — defaults are byte-identical (Strategy::None).
+    let timestep_bias_cfg = {
+        let strategy = timestep_bias::Strategy::parse(&args.timestep_bias_strategy)
+            .map_err(|e| anyhow::anyhow!("--timestep-bias-strategy: {e}"))?;
+        let cfg = timestep_bias::BiasConfig {
+            strategy,
+            multiplier: args.timestep_bias_multiplier,
+            range_min: args.timestep_bias_range_min,
+            range_max: args.timestep_bias_range_max,
+        };
+        if strategy != timestep_bias::Strategy::None {
+            log::info!(
+                "[timestep-bias] strategy={} multiplier={} range=[{}, {}]",
+                strategy.as_str(),
+                cfg.multiplier,
+                cfg.range_min,
+                cfg.range_max
+            );
+        }
+        cfg
+    };
+
+    // Unified OneTrainer timestep distribution dispatch.
+    let timestep_cfg = build_timestep_config(
+        &args.timestep_distribution,
+        args.noising_weight,
+        args.noising_bias,
+    )?;
+
+    // ── Full resume: weights + AdamW state + step counter ────────────────
+    let mut start_step: usize = 0;
+    if let Some(resume_path) = args.resume_full.as_ref() {
+        log::info!("Full-resume from {}", resume_path.display());
+        let loaded = checkpoint::load_full(resume_path, &device)?;
+        let named = model.bundle.named_parameters();
+        checkpoint::apply_lora_weights(&loaded, &named)?;
+        if let Optimizer::AdamW(ref mut adam) = opt {
+            checkpoint::apply_to_optimizer(&loaded, adam, &named, args.rank, args.lora_alpha)?;
+        } else {
+            log::warn!(
+                "[resume-full] non-AdamW resume not yet implemented for {:?}; LoRA weights restored, optimizer state reset",
+                opt.kind()
+            );
+        }
+        model.refresh_lora_cache();
+        start_step = loaded.header.step as usize;
+        if start_step >= args.steps {
+            log::warn!(
+                "Resumed step ({start_step}) >= --steps ({}) — nothing to do.",
+                args.steps
+            );
+            return Ok(());
+        }
+        log::info!("Continuing from step {start_step}/{}", args.steps);
+    }
+
+    let save_mode_full = match args.save_mode.as_str() {
+        "full" => true,
+        "weights" => false,
+        other => anyhow::bail!("--save-mode must be `full` or `weights`, got `{other}`"),
+    };
+
+    let cache_files = trainer_common::list_cache_safetensors(&args.cache_dir)?;
+    log::info!("Found {} cached samples", cache_files.len());
+
+    let mut rng = rand::rngs::StdRng::seed_from_u64(SEED);
+
+    // ── Periodic-sample setup ────────────────────────────────────────────
+    // Pre-encode cond/uncond prompts ONCE then drop Qwen3 from VRAM.
+    let periodic = args.sample_every > 0;
+    // Phase 1: caption-dropout effective probability — disabled if no uncond
+    // source is available (i.e. periodic sample is off so no encoder ran).
+    let mut effective_caption_dropout_prob = args.caption_dropout_probability;
+    if effective_caption_dropout_prob > 0.0 && !periodic {
+        log::warn!(
+            "caption_dropout_probability={:.3} but --sample-every is 0 (no unconditional embedding source) — feature disabled",
+            effective_caption_dropout_prob
+        );
+        effective_caption_dropout_prob = 0.0;
+    }
+    // Prompt texts kept alive (parallel to `sample_prompts`) so periodic
+    // samples can log the prompt string to the board alongside the PNG.
+    let mut sample_prompt_texts: Vec<String> = Vec::new();
+    // Config-driven prompt source: --validation-prompts-file (CLI) OR
+    // train_config.validation_prompts_file, loaded as a SampleLibrary.
+    let validation_prompts_file = args
+        .validation_prompts_file
+        .clone()
+        .or_else(|| train_config.validation_prompts_file.clone());
+    let (sample_prompts, sample_uncond, sample_uncond_mask, sample_vae_path): (
+        Option<Vec<(Tensor, Tensor)>>,
+        Option<Tensor>,
+        Option<Tensor>,
+        Option<PathBuf>,
+    ) = if periodic {
+        let qwen3_path = args
+            .sample_qwen3
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-qwen3"))?;
+        let tok_path = args
+            .sample_tokenizer
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-tokenizer"))?;
+        let vae_path = args
+            .sample_vae
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("--sample-every > 0 requires --sample-vae"))?
+            .clone();
+        log::info!("[sample-setup] loading Qwen3 to encode sample prompt once...");
+        let qwen_w = if qwen3_path.is_file() {
+            flame_core::serialization::load_file(qwen3_path, &device)?
+        } else {
+            let mut all = std::collections::HashMap::new();
+            for entry in std::fs::read_dir(qwen3_path)? {
+                let p = entry?.path();
+                if p.extension().and_then(|e| e.to_str()) == Some("safetensors") {
+                    let part = flame_core::serialization::load_file(&p, &device)?;
+                    all.extend(part);
+                }
+            }
+            all
+        };
+        let mut qcfg = Qwen3Encoder::config_from_weights(&qwen_w)?;
+        qcfg.extract_layers = vec![34]; // Z-Image canonical (matches prepare_zimage)
+        let qwen = Qwen3Encoder::new(qwen_w, qcfg, device.clone());
+        let tok = tokenizers::Tokenizer::from_file(tok_path)
+            .map_err(|e| anyhow::anyhow!("tokenizer: {e}"))?;
+        let encode = |prompt: &str| -> anyhow::Result<(Tensor, Tensor)> {
+            let wrapped = format!(
+                "{ZIMAGE_TEMPLATE_PRE}{}{ZIMAGE_TEMPLATE_POST}",
+                prompt.trim()
+            );
+            let enc = tok
+                .encode(wrapped.as_str(), false)
+                .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+            let mut ids: Vec<i32> = enc.get_ids().iter().map(|&i| i as i32).collect();
+            let real_len = ids.len().min(ZIMAGE_TXT_PAD_LEN);
+            ids.resize(ZIMAGE_TXT_PAD_LEN, ZIMAGE_PAD_TOKEN_ID);
+            let hidden = qwen.encode(&ids)?.to_dtype(DType::BF16)?;
+            let mut mask_data = vec![0f32; ZIMAGE_TXT_PAD_LEN];
+            for slot in mask_data.iter_mut().take(real_len) {
+                *slot = 1.0;
+            }
+            let mask = Tensor::from_vec(
+                mask_data,
+                Shape::from_dims(&[1, ZIMAGE_TXT_PAD_LEN]),
+                device.clone(),
+            )?
+            .to_dtype(DType::BF16)?;
+            Ok((hidden, mask))
+        };
+        // Build list of prompts to render at each sample event. `--sample-prompt`
+        // (single str) is the first entry if non-empty. `--sample-prompts-file`
+        // (newline-separated) appends the rest. Result: Vec<(cap, cap_mask)>.
+        let mut prompts_text: Vec<String> = Vec::new();
+        // Shared negative: --sample-neg-prompt by default; overridden by the
+        // first SampleLibrary entry's negative when a prompts file is given
+        // (Z-Image's sampler uses a single shared uncond, not per-prompt).
+        let mut neg_text = args.sample_neg_prompt.clone();
+        if let Some(ref pf) = validation_prompts_file {
+            let lib = SampleLibrary::from_file(pf)?;
+            log::info!(
+                "[sample-setup] {} prompt(s) from {} (config-driven)",
+                lib.len(),
+                pf.display()
+            );
+            if let Some(first_neg) = lib
+                .prompts
+                .iter()
+                .map(|p| p.negative.clone())
+                .find(|n| !n.trim().is_empty())
+            {
+                neg_text = first_neg;
+            }
+            for p in &lib.prompts {
+                prompts_text.push(p.prompt.clone());
+            }
+        } else {
+            if !args.sample_prompt.trim().is_empty() {
+                prompts_text.push(args.sample_prompt.clone());
+            }
+            if let Some(pf) = args.sample_prompts_file.as_ref() {
+                let raw = std::fs::read_to_string(pf).map_err(|e| {
+                    anyhow::anyhow!("read sample-prompts-file {}: {e}", pf.display())
+                })?;
+                for line in raw.lines() {
+                    let l = line.trim();
+                    if l.is_empty() || l.starts_with('#') {
+                        continue;
+                    }
+                    prompts_text.push(l.to_string());
+                }
+            }
+        }
+        if prompts_text.is_empty() {
+            anyhow::bail!(
+                "--sample-every > 0 requires --validation-prompts-file, --sample-prompt, or --sample-prompts-file"
+            );
+        }
+        let mut encoded: Vec<(Tensor, Tensor)> = Vec::with_capacity(prompts_text.len());
+        for p in &prompts_text {
+            encoded.push(encode(p)?);
+        }
+        // Retain prompt texts for board logging (parallel to `encoded`).
+        sample_prompt_texts = prompts_text.clone();
+        let (unc, unc_mask) = encode(&neg_text)?;
+        log::info!(
+            "[sample-setup] {} prompt(s) encoded; uncond={:?}; dropping Qwen3",
+            encoded.len(),
+            unc.shape().dims(),
+        );
+        drop(qwen);
+        flame_core::cuda_alloc_pool::clear_pool_cache();
+        flame_core::trim_cuda_mempool(0);
+        log::info!(
+            "[sample-setup] periodic sample enabled (every {} steps).",
+            args.sample_every
+        );
+        (Some(encoded), Some(unc), Some(unc_mask), Some(vae_path))
+    } else {
+        (None, None, None, None)
+    };
+
+    // Step-0 baseline (LoRA-init = base output). Renders ALL configured
+    // prompts so the user can later eyeball drift across the full prompt set.
+    if periodic {
+        for (idx, (cap, cap_mask)) in sample_prompts.as_ref().unwrap().iter().enumerate() {
+            let out_path = args
+                .output_dir
+                .join(format!("sample_step0_base_p{idx}.png"));
+            log::info!(
+                "[sample step=0] BASELINE prompt {}/{} → {}",
+                idx + 1,
+                sample_prompts.as_ref().unwrap().len(),
+                out_path.display()
+            );
+            if let Err(e) = zimage_sampler::sample_image(
+                &mut model,
+                cap,
+                Some(cap_mask),
+                sample_uncond.as_ref(),
+                sample_uncond_mask.as_ref(),
+                args.sample_size,
+                args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_shift,
+                args.sample_seed,
+                sample_vae_path.as_ref().unwrap(),
+                &out_path,
+                &device,
+            ) {
+                log::warn!("[sample step=0 p{idx}] failed: {e}");
+            }
+        }
+    }
+
+    let board = trainer_common::open_board_writer(
+        &args.output_dir,
+        trainer_common::board_resume_step(start_step),
+    );
+    if let Some(b) = &board {
+        // Run hyper-parameters → metadata.hparams + the dashboard's hparam
+        // panel. JSON hand-built (no serde_json dep here).
+        let hparams_json = format!(
+            "{{\"model\":\"zimage\",\"steps\":{},\"rank\":{},\"lora_alpha\":{},\"lr\":{},\
+             \"batch_size\":{},\"optimizer\":\"{}\",\"timestep_shift\":{},\
+             \"sample_size\":{},\"sample_steps\":{},\"sample_cfg\":{},\"seed\":{}}}",
+            args.steps,
+            args.rank,
+            args.lora_alpha,
+            args.lr,
+            args.batch_size,
+            opt_kind.as_str(),
+            args.timestep_shift,
+            args.sample_size,
+            args.sample_steps,
+            args.sample_cfg,
+            SEED
+        );
+        b.log_hparams(&hparams_json, &[("steps_target", args.steps as f64)]);
+    }
+    let total_steps = args.steps;
+    if start_step >= total_steps {
+        anyhow::bail!("start_step {} >= --steps {}", start_step, total_steps);
+    }
+    let loop_config = trainer_pipeline::ManualTrainLoopConfig::new(
+        "Z-Image-lora",
+        start_step,
+        total_steps,
+        cache_files.len(),
+        args.batch_size.max(1),
+    );
+    let mut loop_run = trainer_pipeline::ManualTrainLoopRun::new(loop_config);
+
+    let sched: LrScheduler = args.lr_scheduler.parse().unwrap_or_else(|e: String| {
+        log::warn!("[lr_scheduler] {e} — falling back to Constant");
+        LrScheduler::Constant
+    });
+
+    // Phase 2: validation harness — held-out cache + cadence. None at default.
+    // When `validation_every_steps == 0` or `--validation-dataset-dir` is unset,
+    // the harness is not constructed and the per-step val branch never executes
+    // (byte invariance with feature off).
+    let validation_loop: Option<ValidationLoop> = if let (Some(dir), n) = (
+        args.validation_dataset_dir.as_ref(),
+        args.validation_every_steps,
+    ) {
+        if n > 0 {
+            let v = ValidationLoop::new(dir, n)?;
+            log::info!(
+                "[validation] {} held-out samples, every {} steps",
+                v.len(),
+                n
+            );
+            Some(v)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    for step in start_step..total_steps {
+        // Stack `batch_size` cached samples (matches upstream Python klein9b/zimage preset = batch=2).
+        let bs = args.batch_size.max(1);
+        let mut latents_raw = Vec::with_capacity(bs);
+        let mut caps = Vec::with_capacity(bs);
+        let mut masks = Vec::with_capacity(bs);
+        for b in 0..bs {
+            let cache_idx = (step * bs + b) % cache_files.len();
+            let s = flame_core::serialization::load_file(&cache_files[cache_idx], &device)?;
+            latents_raw.push(
+                s.get("latent")
+                    .ok_or_else(|| anyhow::anyhow!("cache {cache_idx} missing 'latent'"))?
+                    .to_dtype(DType::BF16)?,
+            );
+            caps.push(
+                s.get("text_embedding")
+                    .ok_or_else(|| anyhow::anyhow!("cache {cache_idx} missing 'text_embedding'"))?
+                    .to_dtype(DType::BF16)?,
+            );
+            if let Some(m) = s.get("text_mask") {
+                masks.push(Some(m.to_dtype(DType::BF16)?));
+            } else {
+                masks.push(None);
+            }
+        }
+        let raw_latent = if bs == 1 {
+            latents_raw.into_iter().next().unwrap()
+        } else {
+            Tensor::cat(&latents_raw.iter().collect::<Vec<_>>(), 0)?
+        };
+        let latent = raw_latent
+            .to_dtype(DType::F32)?
+            .add_scalar(-ZIMAGE_VAE_SHIFT)?
+            .mul_scalar(ZIMAGE_VAE_SCALE)?;
+        let cap_feats = if bs == 1 {
+            caps.into_iter().next().unwrap()
+        } else {
+            Tensor::cat(&caps.iter().collect::<Vec<_>>(), 0)?
+        };
+        let cap_mask = if masks.iter().all(|m| m.is_some()) {
+            let ms: Vec<Tensor> = masks.into_iter().map(|m| m.unwrap()).collect();
+            Some(if bs == 1 {
+                ms.into_iter().next().unwrap()
+            } else {
+                Tensor::cat(&ms.iter().collect::<Vec<_>>(), 0)?
+            })
+        } else {
+            None
+        };
+
+        // Phase 1: caption dropout. Swap conditional → unconditional (cached
+        // at sample-setup) with probability `p`. No-op when p == 0.0.
+        let (cap_feats, cap_mask) = if effective_caption_dropout_prob > 0.0 {
+            if let (Some(unc), unc_mask) = (sample_uncond.as_ref(), sample_uncond_mask.as_ref()) {
+                use rand::Rng as _;
+                if rng.r#gen::<f32>() < effective_caption_dropout_prob {
+                    let unc_b = if unc.shape().dims()[0] == bs {
+                        unc.clone()
+                    } else {
+                        let mut tgt = unc.shape().dims().to_vec();
+                        tgt[0] = bs;
+                        unc.broadcast_to(&Shape::from_dims(&tgt))?
+                    };
+                    let unc_mask_b = unc_mask
+                        .map(|m| {
+                            if m.shape().dims()[0] == bs {
+                                Ok(m.clone())
+                            } else {
+                                let mut tgt = m.shape().dims().to_vec();
+                                tgt[0] = bs;
+                                m.broadcast_to(&Shape::from_dims(&tgt))
+                            }
+                        })
+                        .transpose()?;
+                    (unc_b, unc_mask_b)
+                } else {
+                    (cap_feats, cap_mask)
+                }
+            } else {
+                (cap_feats, cap_mask)
+            }
+        } else {
+            (cap_feats, cap_mask)
+        };
+
+        // Continuous timestep ∈ [0, NUM_TRAIN_TIMESTEPS), then floor → sigma idx.
+        let raw_t_unshifted = timestep_cfg.sample_one(&mut rng) * NUM_TRAIN_TIMESTEPS as f32;
+        // SD3-style flow-matching shift, identity when shift==1.0.
+        let raw_t = if (args.timestep_shift - 1.0).abs() < 1e-6 {
+            raw_t_unshifted
+        } else {
+            let s = args.timestep_shift;
+            let n = NUM_TRAIN_TIMESTEPS as f32;
+            n * s * raw_t_unshifted / ((s - 1.0) * raw_t_unshifted + n)
+        };
+        // Default-off: Strategy::None → returns raw_t unchanged.
+        let t_continuous =
+            timestep_bias::apply_bias(raw_t, NUM_TRAIN_TIMESTEPS as f32, &timestep_bias_cfg);
+        let sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
+        let sigma = (sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
+        // Z-Image's training-time `t` to the model: OT BaseZImageSetup.py:130 passes
+        // `(1000 - timestep) / 1000` where `timestep` is the integer sigma_idx.
+        // That is `(1000 - sigma_idx) / 1000`. Pre-fix we computed `1.0 - sigma`
+        // = `(999 - sigma_idx) / 1000` — off by exactly 1. Matched to OT source.
+        let t_value = (NUM_TRAIN_TIMESTEPS as f32 - sigma_idx as f32) / NUM_TRAIN_TIMESTEPS as f32;
+
+        // Match OneTrainer: keep the sampled noise, noisy latent, and target
+        // in F32; cast only the model input to BF16.
+        let noise = noise_modifiers::randn_f32(latent.shape().clone(), device.clone())?;
+        // Pyramid / multi-resolution noise (additive). Default-off when
+        // iterations == 0 → byte-identical.
+        let noise = noise_modifiers::maybe_apply_multires_noise(
+            &noise,
+            args.multires_noise_iterations,
+            args.multires_noise_discount,
+            &mut rng,
+        )?;
+        // Phase 1: noise modifiers (default-off). Z-Image trainer does not
+        // load a TrainConfig JSON, so offset_noise_weight isn't surfaced —
+        // defaults to 0.0 (off). Add a CLI flag in a follow-up if needed.
+        // Offset noise is part of the clean noise distribution; perturbation
+        // is added to the model input only. Default-off byte invariance is
+        // preserved because gamma=0 → perturbed_noise == clean_noise.
+        let clean_noise = noise_modifiers::maybe_apply_offset_noise(
+            &noise,
+            0.0,
+            args.noise_offset_probability,
+            &mut rng,
+        )?;
+        let perturbed_noise = noise_modifiers::maybe_apply_input_perturbation(
+            &clean_noise,
+            args.gamma_input_perturbation,
+            &mut rng,
+        )?;
+        let noisy_f32 = perturbed_noise
+            .mul_scalar(sigma)?
+            .add(&latent.mul_scalar(1.0 - sigma)?)?;
+        let noisy = noisy_f32.to_dtype(DType::BF16)?;
+        // Rectified-flow target: pred ≈ -velocity where velocity = noise - clean.
+        // Caller of model.forward in the sampler does `pred * -1`, so the trained
+        // pred is `clean - noise`. Train against that.
+        let target = latent.sub(&clean_noise)?;
+        let timestep = Tensor::from_vec(vec![t_value], Shape::from_dims(&[1]), device.clone())?
+            .to_dtype(DType::BF16)?;
+
+        // ── Same-batch parity probe override (HANDOFF_2026-05-24) ──
+        // Only fires at step 0 when --replay-from is set. Overrides the
+        // freshly-sampled (latent, noise, noisy, target, timestep, cap_feats,
+        // cap_mask) with values dumped by OT's BaseZImageSetup.predict so
+        // both trainers see literally the same input. After backward we
+        // dump per-LoRA grads and exit.
+        let (latent, _noise, noisy, target, timestep, cap_feats, cap_mask) =
+            if step == 0 && args.replay_from.is_some() {
+                let path = args.replay_from.as_ref().unwrap().clone();
+                log::info!("[replay] loading OT step-1 inputs from {}", path.display());
+                let ot = flame_core::serialization::load_file(&path, &device)?;
+
+                // Required tensors. OT's keys (see BaseZImageSetup.predict
+                // dump): scaled_latent_image, latent_noise,
+                // scaled_noisy_latent_image, timestep (int64, per-sample),
+                // sigma (per-sample scalar), flow_target, plus
+                // text_encoder_output_{i} (variable-length per sample).
+                let scaled_latent = ot
+                    .get("scaled_latent_image")
+                    .ok_or_else(|| anyhow::anyhow!("replay: missing scaled_latent_image"))?
+                    .to_dtype(DType::F32)?;
+                let ot_noise = ot
+                    .get("latent_noise")
+                    .ok_or_else(|| anyhow::anyhow!("replay: missing latent_noise"))?
+                    .to_dtype(DType::F32)?;
+                let ot_noisy = ot
+                    .get("scaled_noisy_latent_image")
+                    .ok_or_else(|| anyhow::anyhow!("replay: missing scaled_noisy_latent_image"))?
+                    .to_dtype(DType::BF16)?;
+                // CONVENTION FIX: OT's `flow_target` is `noise - clean` (the
+                // velocity dir in flow-matching). Our trainer's `target` is
+                // `clean - noise` (so that `pred ≈ -velocity` after the
+                // sampler's pred*-1 — see comment at line 1057). Negate.
+                let ot_target = ot
+                    .get("flow_target")
+                    .ok_or_else(|| anyhow::anyhow!("replay: missing flow_target"))?
+                    .to_dtype(DType::F32)?
+                    .mul_scalar(-1.0)?;
+                let ot_ts = ot
+                    .get("timestep")
+                    .ok_or_else(|| anyhow::anyhow!("replay: missing timestep"))?
+                    .to_dtype(DType::F32)?;
+                // OT timestep is per-sample float (original int64, dumped as
+                // F32 for flame-core's safetensors loader). Ours uses scalar
+                // t_value = 1 - sigma where sigma = (idx+1)/NUM_TRAIN_TIMESTEPS.
+                // To replay faithfully, build a per-sample BF16 t vector with
+                // OT's exact (1000 - timestep)/1000 mapping (per
+                // BaseZImageSetup.predict line 130).
+                let ts_f32: Vec<f32> = ot_ts.to_vec()?;
+                let ts_i64: Vec<i64> = ts_f32.iter().map(|&f| f as i64).collect();
+                let t_vals: Vec<f32> = ts_f32
+                    .iter()
+                    .map(|&t| (NUM_TRAIN_TIMESTEPS as f32 - t) / NUM_TRAIN_TIMESTEPS as f32)
+                    .collect();
+                let ot_timestep = Tensor::from_vec(
+                    t_vals.clone(),
+                    Shape::from_dims(&[t_vals.len()]),
+                    device.clone(),
+                )?
+                .to_dtype(DType::BF16)?;
+                log::info!(
+                    "[replay] latent={:?} noise={:?} noisy={:?} target={:?} ts={:?} t_vals={:?}",
+                    scaled_latent.shape().dims(),
+                    ot_noise.shape().dims(),
+                    ot_noisy.shape().dims(),
+                    ot_target.shape().dims(),
+                    ts_i64,
+                    t_vals,
+                );
+
+                // Text encoder: variable-length per sample. Pad to max
+                // length and build mask. OT keys: text_encoder_output_{i}
+                // for i in 0..batch_size.
+                // batch size: count consecutive text_encoder_output_{i}
+                // entries from i=0 (int64 scalar in dump isn't loadable by
+                // flame-core's safetensors path).
+                let mut per_sample: Vec<Tensor> = Vec::new();
+                let mut seq_lens: Vec<usize> = Vec::new();
+                for i in 0usize.. {
+                    let k = format!("text_encoder_output_{}", i);
+                    match ot.get(&k) {
+                        Some(t) => {
+                            let tb = t.to_dtype(DType::BF16)?;
+                            seq_lens.push(tb.shape().dims()[0]);
+                            per_sample.push(tb);
+                        }
+                        None => break,
+                    }
+                }
+                if per_sample.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "replay: no text_encoder_output_<i> tensors found"
+                    ));
+                }
+                let bs_t = per_sample.len();
+                let l_max = *seq_lens.iter().max().unwrap_or(&0);
+                let d_model = per_sample[0].shape().dims()[1];
+                log::info!(
+                    "[replay] text_encoder bs={} L_max={} D={} per_sample_lens={:?}",
+                    bs_t,
+                    l_max,
+                    d_model,
+                    seq_lens
+                );
+
+                // Build padded cap_feats [bs, L_max, D] BF16 + cap_mask [bs, L_max] BF16.
+                let mut padded_flat: Vec<f32> = vec![0.0; bs_t * l_max * d_model];
+                let mut mask_flat: Vec<f32> = vec![0.0; bs_t * l_max];
+                for (i, t) in per_sample.iter().enumerate() {
+                    let v: Vec<f32> = t.to_dtype(DType::F32)?.to_vec()?;
+                    let li = seq_lens[i];
+                    for p in 0..li {
+                        for d in 0..d_model {
+                            padded_flat[i * l_max * d_model + p * d_model + d] = v[p * d_model + d];
+                        }
+                        mask_flat[i * l_max + p] = 1.0;
+                    }
+                }
+                let cap = Tensor::from_vec(
+                    padded_flat,
+                    Shape::from_dims(&[bs_t, l_max, d_model]),
+                    device.clone(),
+                )?
+                .to_dtype(DType::BF16)?;
+                let cmask =
+                    Tensor::from_vec(mask_flat, Shape::from_dims(&[bs_t, l_max]), device.clone())?
+                        .to_dtype(DType::BF16)?;
+
+                (
+                    scaled_latent,
+                    ot_noise,
+                    ot_noisy,
+                    ot_target,
+                    ot_timestep,
+                    cap,
+                    Some(cmask),
+                )
+            } else {
+                (
+                    latent,
+                    clean_noise,
+                    noisy,
+                    target,
+                    timestep,
+                    cap_feats,
+                    cap_mask,
+                )
+            };
+
+        if step == 0 {
+            log::info!(
+                "step 0 | latent={:?} cap={:?} sigma={:.4} (idx={})",
+                latent.shape().dims(),
+                cap_feats.shape().dims(),
+                sigma,
+                sigma_idx
+            );
+        }
+
+        let pred = model.forward(&noisy, &timestep, &cap_feats, cap_mask.as_ref())?;
+
+        // Same-batch probe: dump our predicted_flow at step 0 (when
+        // replaying) so we can compare element-wise vs OT's predicted_flow
+        // in the input safetensors dump.
+        if step == 0 && args.replay_from.is_some() {
+            let pred_vec: Vec<f32> = pred.to_dtype(DType::F32)?.to_vec()?;
+            let n = pred_vec.len() as f32;
+            let mean = pred_vec.iter().sum::<f32>() / n;
+            let var = pred_vec
+                .iter()
+                .map(|x| (x - mean) * (x - mean))
+                .sum::<f32>()
+                / n;
+            let std = var.sqrt();
+            let max_abs = pred_vec.iter().fold(0f32, |a, &b| a.max(b.abs()));
+            let l2 = pred_vec.iter().map(|x| x * x).sum::<f32>().sqrt();
+            log::info!(
+                "[replay] OURS predicted_flow stats: mean={:+.3e} std={:.3e} max_abs={:.3e} L2={:.3e} shape={:?}",
+                mean, std, max_abs, l2, pred.shape().dims()
+            );
+            // Also compute target stats + pred-target stats for context.
+            let tgt_vec: Vec<f32> = target.to_dtype(DType::F32)?.to_vec()?;
+            let tmean = tgt_vec.iter().sum::<f32>() / n;
+            let tvar = tgt_vec
+                .iter()
+                .map(|x| (x - tmean) * (x - tmean))
+                .sum::<f32>()
+                / n;
+            let tstd = tvar.sqrt();
+            let diff_l2 = pred_vec
+                .iter()
+                .zip(tgt_vec.iter())
+                .map(|(a, b)| (a - b) * (a - b))
+                .sum::<f32>()
+                .sqrt();
+            log::info!(
+                "[replay] OURS target stats:         mean={:+.3e} std={:.3e}  ||pred-target||_L2={:.3e}",
+                tmean, tstd, diff_l2
+            );
+            // Save predicted_flow to a safetensors for element-wise compare.
+            let dump_path = std::env::var("REPLAY_DUMP_PRED")
+                .unwrap_or_else(|_| "/tmp/ours_predicted_flow.safetensors".to_string());
+            let mut map = std::collections::HashMap::new();
+            map.insert("predicted_flow".to_string(), pred.to_dtype(DType::BF16)?);
+            map.insert("target".to_string(), target.to_dtype(DType::BF16)?);
+            flame_core::serialization::save_file(&map, &dump_path)?;
+            log::info!(
+                "[replay] wrote OURS predicted_flow + target → {}",
+                dump_path
+            );
+        }
+
+        if pred.shape().dims() != target.shape().dims() {
+            anyhow::bail!(
+                "pred {:?} != target {:?}",
+                pred.shape().dims(),
+                target.shape().dims()
+            );
+        }
+
+        // Combined loss + per-step weighting matching OT's _flow_matching_losses.
+        // mse_strength / mae_strength / loss_weight_fn are read from --config JSON
+        // when provided (OT ModelSetupDiffusionLossMixin.py:150,155); otherwise the
+        // OT default values (mse=1.0, mae=0.0, loss_weight_fn=Constant) apply.
+        let pred_f32 = pred.to_dtype(DType::F32)?;
+        let target_f32 = target.to_dtype(DType::F32)?;
+        let raw_loss = loss_weight::combined_loss(
+            &pred_f32,
+            &target_f32,
+            train_config.mse_strength as f32,
+            train_config.mae_strength as f32,
+            args.huber_strength,
+        )?;
+        let loss = loss_weight::apply_loss_weight(
+            &raw_loss,
+            sigma,
+            train_config.loss_weight_fn,
+            args.min_snr_gamma,
+            true,
+        )?;
+        let loss_val = loss.to_vec()?[0];
+
+        // FORWARD-ONLY BENCH MODE: skip backward + optimizer when
+        // FLAME_FORWARD_ONLY_BENCH=1. Used only for isolating forward
+        // vs backward s/step. Loss + autograd recording still happen.
+        let forward_only_bench = std::env::var("FLAME_FORWARD_ONLY_BENCH").is_ok();
+        if forward_only_bench {
+            AutogradContext::clear();
+            // Still emit the per-step progress log so we get s/step timing.
+            loop_run.record_and_log_as(
+                "Z-Image-fwd-only",
+                step - start_step,
+                trainer_pipeline::TrainStepMetrics {
+                    loss_value: loss_val,
+                    grad_norm: 0.0,
+                    learning_rate: 0.0,
+                },
+                board.as_ref(),
+            );
+            continue;
+        }
+
+        // Phase 5b / gate-on 6a: Route (ii) bridge. v2 is the default; backward
+        // constructs a `MatchInsertedDtype` GradientMap (grads at loss.dtype(),
+        // BF16 end-to-end) unless `--use-autograd-v3` opts into the legacy v3
+        // backward (byte-equivalent to pre-flag behaviour).
+        let mut grads = trainer_pipeline::backward_loss(&loss, args.use_autograd_v3)?;
+
+        // Grad-flow diagnostic.  Runs at step 1 — NOT step 0 — because every
+        // LoRA-style algo (LoRA, LoCon, LoHa, LoKr) initializes one factor
+        // at zero so `delta = factor_a @ factor_b = 0` at step 0.  Backward
+        // through `delta * weight` then forces half the leaves to zero
+        // gradient by mathematical construction.  Step 1 (after the first
+        // optimizer step has driven the zero leaves off zero) is when the
+        // assertion can distinguish "real bug" from "expected zero-init
+        // pattern".  See flame-core/docs/TRAINER_DIAGNOSTICS.md.
+        if step == 1 {
+            let named = model.bundle.named_parameters();
+            let named_refs: Vec<(&str, &flame_core::parameter::Parameter)> =
+                named.iter().map(|(n, p)| (n.as_str(), p)).collect();
+            let report = flame_core::diagnostics::assert_grad_flow(&grads, &named_refs)?;
+            if report.is_clean() {
+                log::info!("[grad-flow] step 2 clean ({} params)", report.ok_count);
+            } else {
+                log::warn!("{}", report.summary());
+            }
+        }
+
+        // Diagnostic: dump per-block per-role LoRA grad norms at fixed steps.
+        // Set FLAME_DUMP_QKV_GRADS=1 to enable. Surfaces whether Q/K grads
+        // diverge from V grads (RoPE/QKV-split bwd suspicion).
+        if (std::env::var("FLAME_DUMP_QKV_GRADS").as_deref() == Ok("1")
+            && matches!(step, 1 | 5 | 10 | 25 | 50))
+            || (step == 0 && args.replay_from.is_some())
+        {
+            let named = model.bundle.named_parameters();
+            // Group by (block_idx, role) where role ∈ {q_a,q_b,k_a,k_b,v_a,v_b,...}
+            let mut rows: Vec<(String, f32)> = Vec::new();
+            for (name, param) in &named {
+                if let Some(g) = grads.get(param.id()) {
+                    let v = g
+                        .to_dtype(DType::F32)
+                        .and_then(|t| t.to_vec())
+                        .unwrap_or_default();
+                    let n = (v.iter().map(|x| x * x).sum::<f32>()).sqrt();
+                    rows.push((name.clone(), n));
+                } else {
+                    rows.push((name.clone(), -1.0));
+                }
+            }
+            log::info!("[QKV-DUMP step={}] -- begin --", step);
+            for (n, val) in &rows {
+                log::info!("[QKV-DUMP step={}] {:60} ||grad||={:.6e}", step, n, val);
+            }
+            log::info!("[QKV-DUMP step={}] -- end --", step);
+
+            // Same-batch parity probe: after dumping at step 0, exit
+            // immediately so we capture pre-opt-step grads on identical
+            // inputs to OT's step-1 dump. Skip optimizer entirely.
+            if step == 0 && args.replay_from.is_some() {
+                log::info!("[replay] step-0 QKV-DUMP complete — exiting before optimizer step.");
+                return Ok(());
+            }
+        }
+        // OT default: clip_grad_norm = 1.0. Mirrors train_ernie.rs.
+        const CLIP_GRAD_NORM: f32 = 1.0;
+        // Fusion Sprint Phase 5: device-resident global L2 norm — one D2H per step.
+        let grad_refs: Vec<&flame_core::Tensor> =
+            params.iter().filter_map(|p| grads.get(p.id())).collect();
+        let total_norm = flame_core::ops::grad_norm::global_l2_norm(&grad_refs)?.item()? as f32;
+        let scale = if total_norm > CLIP_GRAD_NORM {
+            CLIP_GRAD_NORM / total_norm
+        } else {
+            1.0
+        };
+
+        // FLAME_MT_SCALE=1 collapses the per-parameter mul_scalar loop into a
+        // single multi-tensor kernel launch when the clip path fires. Default
+        // off: zimage's grad_norm stays well below 1.0 in production configs,
+        // so the multi-tensor path adds no value. See
+        // EriDiffusion-v2/HANDOFF_2026-05-12_PHASE2_SCALE_FOLLOWUP.md.
+        // Phase 5b: under `--use-autograd-v2`, grads are BF16 in the map;
+        // the FLAME_MT_SCALE fast path asserts F32 and would bail. Fall
+        // back to the per-param mul_scalar loop in that case.
+        let mt_scale_enabled = std::env::var("FLAME_MT_SCALE")
+            .ok()
+            .as_deref()
+            .map(|v| matches!(v, "1" | "true" | "TRUE"))
+            .unwrap_or(false)
+            && args.use_autograd_v3;
+
+        if mt_scale_enabled && scale < 1.0 {
+            // Multi-tensor in-place scale. Extract device pointers as u64
+            // values so the &mut Tensor borrow from get_mut releases between
+            // iterations — Rust won't let us hold N concurrent &mut into the
+            // map.
+            let mut ptrs: Vec<u64> = Vec::with_capacity(params.len());
+            let mut sizes: Vec<u64> = Vec::with_capacity(params.len());
+            let mut device_opt: Option<std::sync::Arc<flame_core::CudaDevice>> = None;
+            for param in &params {
+                if let Some(g) = grads.get_mut(param.id()) {
+                    if g.dtype() != flame_core::DType::F32 {
+                        anyhow::bail!(
+                            "FLAME_MT_SCALE expects F32 grads (GradientMap policy is F32), got {:?}",
+                            g.dtype()
+                        );
+                    }
+                    if device_opt.is_none() {
+                        device_opt = Some(g.device().clone());
+                    }
+                    ptrs.push(g.as_mut_device_ptr_f32("mt_scale:g")?);
+                    sizes.push(g.shape().elem_count() as u64);
+                }
+            }
+            let n = ptrs.len();
+            if n > 0 {
+                let mut packed: Vec<u64> = Vec::with_capacity(2 * n);
+                packed.extend(ptrs);
+                packed.extend(sizes);
+                let device = device_opt.expect("at least one grad present");
+                let cache_cell = MT_SCALE_CACHE.get_or_init(|| {
+                    Mutex::new(flame_core::ops::multi_tensor::MultiTensorMetaCache::new())
+                });
+                let mut cache = cache_cell
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("MT_SCALE_CACHE mutex poisoned"))?;
+                flame_core::ops::multi_tensor::multi_tensor_scale_inplace_packed(
+                    &mut cache, &device, n, &packed, scale, /* is_bf16 = */ false,
+                )?;
+            }
+            // Grads now hold scaled values in place. set_grad clones the
+            // (already-scaled) tensor into the parameter's grad slot.
+            for param in &params {
+                if let Some(g) = grads.get(param.id()) {
+                    param.set_grad(g.clone())?;
+                }
+            }
+        } else {
+            for param in &params {
+                if let Some(g) = grads.get(param.id()) {
+                    let g_scaled = if scale < 1.0 {
+                        g.mul_scalar(scale)?
+                    } else {
+                        g.clone()
+                    };
+                    param.set_grad(g_scaled)?;
+                }
+            }
+        }
+        // Phase 5: dispatch LR. Default sched=Constant + warmup_steps=0
+        // returns args.lr exactly → byte-equivalent to prior behaviour.
+        let cur_lr = lr_schedule::dispatch_lr(
+            &sched,
+            args.lr,
+            step,
+            args.steps,
+            args.warmup_steps,
+            args.lr_min_factor,
+            args.lr_cycles,
+        );
+        trainer_pipeline::step_optimizer(&mut opt, &params, cur_lr, || {
+            if let Some(ref mut e) = ema {
+                e.update_with_schedule(&params, &ema_cfg, (step + 1) as u64)
+                    .map_err(|err| {
+                        anyhow::anyhow!("EMA update failed at step {}: {err}", step + 1)
+                    })?;
+            }
+            Ok(())
+        })?;
+        model.refresh_lora_cache();
+
+        loop_run.record_and_log(
+            step,
+            trainer_pipeline::TrainStepMetrics {
+                loss_value: loss_val,
+                grad_norm: total_norm,
+                learning_rate: cur_lr,
+            },
+            board.as_ref(),
+        );
+
+        // Per-step permute_generic tally dump. Default off; enable with
+        // `FLAME_TRACE_PERMUTE_GENERIC=1`. Dumps + resets after each step
+        // so the printed counts are "this step only".
+        flame_core::cuda_kernels::permute_generic_trace::dump();
+
+        // Phase 2: validation eval pass (no_grad) every `validation_every_steps`.
+        // Mirrors the training step under AutogradContext::no_grad() with the
+        // SAME schedule/loss/forward signature. Uses a SIDE-RNG seeded from
+        // `SEED ^ (step+1)` so the training-side `rng` (StdRng seeded from SEED)
+        // is not perturbed — byte invariance with feature off (validation_loop
+        // is None) is preserved. Runs BEFORE EMA swap / save, mirroring Klein.
+        if let Some(ref vloop) = validation_loop {
+            if vloop.should_run(step + 1) {
+                let mut sum = 0.0_f32;
+                let mut count = 0_usize;
+                for vfile in &vloop.cache_files {
+                    let _g = AutogradContext::no_grad();
+                    let sample = match flame_core::serialization::load_file(vfile, &device) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            log::warn!("[validation] load {} failed: {e}", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_lat_raw = match sample.get("latent") {
+                        Some(t) => match t.to_dtype(DType::BF16) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                log::warn!("[validation] {} latent dtype: {e}", vfile.display());
+                                continue;
+                            }
+                        },
+                        None => {
+                            log::warn!("[validation] {} missing latent", vfile.display());
+                            continue;
+                        }
+                    };
+                    // Apply the same VAE shift/scale the training step uses.
+                    let v_lat = match v_lat_raw
+                        .add_scalar(-ZIMAGE_VAE_SHIFT)
+                        .and_then(|t| t.mul_scalar(ZIMAGE_VAE_SCALE))
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] {} latent scale: {e}", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_cap = match sample.get("text_embedding") {
+                        Some(t) => match t.to_dtype(DType::BF16) {
+                            Ok(t) => t,
+                            Err(e) => {
+                                log::warn!(
+                                    "[validation] {} text_embedding dtype: {e}",
+                                    vfile.display()
+                                );
+                                continue;
+                            }
+                        },
+                        None => {
+                            log::warn!("[validation] {} missing text_embedding", vfile.display());
+                            continue;
+                        }
+                    };
+                    let v_cap_mask = match sample.get("text_mask") {
+                        Some(t) => match t.to_dtype(DType::BF16) {
+                            Ok(t) => Some(t),
+                            Err(e) => {
+                                log::warn!("[validation] {} text_mask dtype: {e}", vfile.display());
+                                None
+                            }
+                        },
+                        None => None,
+                    };
+                    // Side-RNG so training-side `rng` is not perturbed.
+                    let mut vrng = rand::rngs::StdRng::seed_from_u64(SEED ^ (step as u64 + 1));
+                    let raw_t_unshifted =
+                        timestep_cfg.sample_one(&mut vrng) * NUM_TRAIN_TIMESTEPS as f32;
+                    let raw_t = if (args.timestep_shift - 1.0).abs() < 1e-6 {
+                        raw_t_unshifted
+                    } else {
+                        let s = args.timestep_shift;
+                        let n = NUM_TRAIN_TIMESTEPS as f32;
+                        n * s * raw_t_unshifted / ((s - 1.0) * raw_t_unshifted + n)
+                    };
+                    let t_continuous = timestep_bias::apply_bias(
+                        raw_t,
+                        NUM_TRAIN_TIMESTEPS as f32,
+                        &timestep_bias_cfg,
+                    );
+                    let v_sigma_idx = (t_continuous.floor() as usize).min(NUM_TRAIN_TIMESTEPS - 1);
+                    let v_sigma = (v_sigma_idx + 1) as f32 / NUM_TRAIN_TIMESTEPS as f32;
+                    let v_t_value = 1.0 - v_sigma;
+                    let v_noise =
+                        match Tensor::randn(v_lat.shape().clone(), 0.0, 1.0, device.clone())
+                            .and_then(|t| t.to_dtype(DType::BF16))
+                        {
+                            Ok(t) => t,
+                            Err(e) => {
+                                log::warn!("[validation] noise: {e}");
+                                continue;
+                            }
+                        };
+                    let v_noisy = match v_noise
+                        .mul_scalar(v_sigma)
+                        .and_then(|t| v_lat.mul_scalar(1.0 - v_sigma).and_then(|c| t.add(&c)))
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] noisy: {e}");
+                            continue;
+                        }
+                    };
+                    // Match training: target = clean - noise (Z-Image's negated
+                    // velocity convention; see line above `let target = ...`).
+                    let v_target = match v_lat.sub(&v_noise) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] target: {e}");
+                            continue;
+                        }
+                    };
+                    let v_timestep = match Tensor::from_vec(
+                        vec![v_t_value],
+                        Shape::from_dims(&[1]),
+                        device.clone(),
+                    )
+                    .and_then(|t| t.to_dtype(DType::BF16))
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] timestep: {e}");
+                            continue;
+                        }
+                    };
+                    let v_pred =
+                        match model.forward(&v_noisy, &v_timestep, &v_cap, v_cap_mask.as_ref()) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::warn!("[validation] forward failed: {e}");
+                                continue;
+                            }
+                        };
+                    let v_loss = match v_pred
+                        .to_dtype(DType::F32)
+                        .and_then(|p| v_target.to_dtype(DType::F32).and_then(|t| p.sub(&t)))
+                        .and_then(|d| d.square())
+                        .and_then(|d| d.mean())
+                    {
+                        Ok(t) => t,
+                        Err(e) => {
+                            log::warn!("[validation] loss: {e}");
+                            continue;
+                        }
+                    };
+                    let v_loss_val = match v_loss.to_vec() {
+                        Ok(v) if !v.is_empty() => v[0],
+                        _ => {
+                            AutogradContext::clear();
+                            continue;
+                        }
+                    };
+                    if v_loss_val.is_finite() {
+                        sum += v_loss_val;
+                        count += 1;
+                    }
+                    AutogradContext::clear();
+                }
+                if count > 0 {
+                    let val_avg = sum / count as f32;
+                    log::info!(
+                        "[validation step={}] loss/val = {:.4} ({} samples)",
+                        step + 1,
+                        val_avg,
+                        count
+                    );
+                    if let Some(b) = &board {
+                        b.log_scalar("loss/val", (step + 1) as u64, val_avg as f64);
+                    }
+                }
+            }
+        }
+
+        // ── Periodic save (independent of sample) ──────────────────────
+        let step_num = step + 1;
+        let sample_now = periodic && trainer_common::cadence_fires(args.sample_every, step_num, args.steps);
+        let save_now = sample_now || trainer_common::cadence_fires(args.save_every, step_num, args.steps);
+        if save_now {
+            trainer_pipeline::with_optional_ema_swap(
+                ema.as_ref(),
+                &params,
+                args.ema_validation_swap,
+                "mid",
+                || {
+                    let mid_ckpt = args
+                        .output_dir
+                        .join(format!("zimage_lora_step{step_num}.safetensors"));
+                    trainer_pipeline::save_lora_checkpoint(
+                        trainer_pipeline::CheckpointSaveOptions {
+                            trainer: "train_zimage",
+                            path: &mid_ckpt,
+                            step: step_num as u64,
+                            rank: args.rank,
+                            alpha: args.lora_alpha,
+                            seed: SEED,
+                            config_hash: "",
+                            save_mode_full,
+                            label: &format!("[mid-save step {step_num}]"),
+                        },
+                        &opt,
+                        || Ok(model.bundle.named_parameters()),
+                        || {
+                            model.bundle.save(&mid_ckpt)?;
+                            Ok(())
+                        },
+                    )?;
+
+                    // ── Periodic inline sample ─────────────────────────────────────
+                    if sample_now {
+                        let prompts = sample_prompts.as_ref().unwrap();
+                        // ScheduleFree eval-mode swap: `p` currently holds the train
+                        // weight `y`. Sampling at `y` produces visibly worse output than
+                        // the eval weight `x = lerp(y, z, 1 - beta1)`. No-op for non-SF
+                        // optimizers.
+                        if let Err(e) = opt.enter_eval_mode(&params) {
+                            log::warn!("[sample step={step_num}] enter_eval_mode failed: {e}");
+                        }
+                        model.refresh_lora_cache();
+                        for (idx, (cap, cap_mask)) in prompts.iter().enumerate() {
+                            let sample_out = args
+                                .output_dir
+                                .join(format!("sample_step{step_num}_p{idx}.png"));
+                            log::info!(
+                                "[sample step={step_num}] prompt {}/{} → {}",
+                                idx + 1,
+                                prompts.len(),
+                                sample_out.display(),
+                            );
+                            if let Err(e) = zimage_sampler::sample_image(
+                                &mut model,
+                                cap,
+                                Some(cap_mask),
+                                sample_uncond.as_ref(),
+                                sample_uncond_mask.as_ref(),
+                                args.sample_size,
+                                args.sample_size,
+                                args.sample_steps,
+                                args.sample_cfg,
+                                args.sample_shift,
+                                args.sample_seed,
+                                sample_vae_path.as_ref().unwrap(),
+                                &sample_out,
+                                &device,
+                            ) {
+                                log::warn!("[sample step={step_num} p{idx}] failed: {e}");
+                            } else if let Some(b) = &board {
+                                let label = format!("p{idx}");
+                                b.log_image_png(&format!("samples/{label}"), step_num as u64, 0, &sample_out);
+                                if let Some(t) = sample_prompt_texts.get(idx) {
+                                    b.log_text(&format!("prompts/{label}"), step_num as u64, t);
+                                }
+                            }
+                        }
+                        if let Err(e) = opt.exit_eval_mode(&params) {
+                            log::warn!("[sample step={step_num}] exit_eval_mode failed: {e}");
+                        }
+                        model.refresh_lora_cache();
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+    }
+
+    // Final EMA swap before final save+sample. No restore — process exits.
+    trainer_pipeline::swap_ema_for_final_save(ema.as_ref(), &params, args.ema_validation_swap)?;
+
+    let completion = loop_run.completion();
+    let trained = completion.trained_steps;
+    let avg_loss = completion.average_loss;
+    log::info!(
+        "Training complete: {trained} new steps (total step={total_steps}), avg loss={:.4}",
+        avg_loss
+    );
+    trainer_pipeline::mark_board_completed(board.as_ref());
+
+    let ckpt = args
+        .output_dir
+        .join(format!("zimage_lora_{}steps.safetensors", args.steps));
+    trainer_pipeline::save_lora_checkpoint_strict(
+        trainer_pipeline::CheckpointSaveOptions {
+            trainer: "train_zimage",
+            path: &ckpt,
+            step: total_steps as u64,
+            rank: args.rank,
+            alpha: args.lora_alpha,
+            seed: SEED,
+            config_hash: "",
+            save_mode_full,
+            label: "[final]",
+        },
+        &opt,
+        || Ok(model.bundle.named_parameters()),
+        || {
+            model.save_weights(&ckpt)?;
+            Ok(())
+        },
+    )?;
+
+    // Final sample (all configured prompts) — swap to ScheduleFree eval weight.
+    if periodic {
+        let prompts = sample_prompts.as_ref().unwrap();
+        if let Err(e) = opt.enter_eval_mode(&params) {
+            log::warn!("[sample final] enter_eval_mode failed: {e}");
+        }
+        model.refresh_lora_cache();
+        for (idx, (cap, cap_mask)) in prompts.iter().enumerate() {
+            let sample_out = args
+                .output_dir
+                .join(format!("sample_step{}_p{}.png", args.steps, idx));
+            log::info!(
+                "[sample step={} FINAL] prompt {}/{} → {}",
+                args.steps,
+                idx + 1,
+                prompts.len(),
+                sample_out.display(),
+            );
+            if let Err(e) = zimage_sampler::sample_image(
+                &mut model,
+                cap,
+                Some(cap_mask),
+                sample_uncond.as_ref(),
+                sample_uncond_mask.as_ref(),
+                args.sample_size,
+                args.sample_size,
+                args.sample_steps,
+                args.sample_cfg,
+                args.sample_shift,
+                args.sample_seed,
+                sample_vae_path.as_ref().unwrap(),
+                &sample_out,
+                &device,
+            ) {
+                log::warn!("[sample final p{idx}] failed: {e}");
+            } else if let Some(b) = &board {
+                let label = format!("p{idx}");
+                b.log_image_png(
+                    &format!("samples/{label}"),
+                    args.steps as u64,
+                    0,
+                    &sample_out,
+                );
+                if let Some(t) = sample_prompt_texts.get(idx) {
+                    b.log_text(&format!("prompts/{label}"), args.steps as u64, t);
+                }
+            }
+        }
+        if let Err(e) = opt.exit_eval_mode(&params) {
+            log::warn!("[sample final] exit_eval_mode failed: {e}");
+        }
+    }
+    Ok(())
+}

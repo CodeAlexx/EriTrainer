@@ -1,0 +1,15 @@
+[package]
+name = "eritrainer-dispatch"
+version = "0.1.0"
+edition = "2021"
+description = "Lightweight EriTrainer training dispatcher"
+
+[[bin]]
+name = "train"
+path = "src/main.rs"
+
+[dependencies]
+eritrainer-registry = { path = "../eritrainer-registry" }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }

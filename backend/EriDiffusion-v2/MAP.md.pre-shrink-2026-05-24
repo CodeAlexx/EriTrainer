@@ -1,0 +1,194 @@
+# EriDiffusion-v2 — Navigation Map
+
+Pure-Rust trainers. Sister to `flame-core` (tensor + autograd) and
+`inference-flame` (inference). Read this first after `/clear` to orient.
+
+Workspace at `/home/alex/EriDiffusion/EriDiffusion-v2/`. Two crates:
+
+| Crate | Path | Role |
+|---|---|---|
+| `eridiffusion-core` | `crates/eridiffusion-core/` | library: models, training loop, encoders, samplers, data, LoRA/LyCORIS, offload |
+| `eridiffusion-cli` | `crates/eridiffusion-cli/` | binaries: `train_*`, `prepare_*`, `sample_*`, `parity_*` |
+
+`flame-core` is pinned at `=26.15.1` in workspace `Cargo.toml` — flame-core
+minor bumps are an ABI gate, EDv2 follows in lockstep.
+
+## 1. Binaries (60 total in `crates/eridiffusion-cli/src/bin/`)
+
+Run from workspace root: `cargo run --release --bin <name> -- <config.toml>`.
+
+| Family | Count | Pattern |
+|---|---|---|
+| `train_*` | 17 | the trainers — read these first when porting/debugging |
+| `prepare_*` | 14 | dataset prep: encode captions + VAE latents to cache |
+| `sample_*` | 13 | render samples mid-/post-training from a checkpoint |
+| `parity_*` | 12 | per-model PyTorch-vs-flame parity harnesses |
+| `convert_*` | 1 | LoRA format converters (e.g. `convert_zimage_lora`) |
+| misc | 3 | `bench_linear_parity`, `decode_cached_anima`, `vae_bisect` |
+
+Trainers shipped (17 `train_*.rs` binaries): `acestep`, `anima`, `asymflow`,
+`chroma`, `ernie`, `flux`, `hidream_o1`, `klein` (4B/9B), `l2p`, `ltx2`,
+`qwenimage`, `sd35`, `sdxl`, `slider_klein`, `u1` (SenseNova), `wan22`,
+`zimage`. The `models/` table below lists shared per-model module files;
+some trainer binaries (e.g. `train_hidream_o1`, `train_l2p`,
+`train_slider_klein`) live as binaries only and reuse other models'
+core modules.
+
+**Configs live FLAT under `configs/*.json`** — e.g. `configs/klein9b_alina.json`,
+`configs/eri2_chroma_lora.json`, `configs/asymflux2_klein_lora.json`.
+No per-model subdirectories. `ls configs/` to find yours. Always grep
+configs before assuming defaults — many trainer-specific flags only
+appear there.
+
+## 2. `eridiffusion-core/src/` layout
+
+```
+adapter.rs               trait Adapter (LoRA-like injection points)
+config/                  TrainConfig, enums (optimizer, scheduler, etc.)
+data/                    bucket_dataset.rs (multi-resolution bucketing)
+debug.rs
+encoders/                CLIP-L/G, T5-XXL, UMT5, Llama3, Mistral3B, Qwen2.5VL/Qwen3,
+                         Gemma3, plus every VAE (flux/sdxl/ltx2/wan21/wan22/zimage/ldm)
+lib.rs                   re-exports flame_core, defines EriDiffusionError
+lora.rs                  LoRALinear primitive (project-owned, not lycoris-rs)
+lycoris.rs               LyCORIS adapter glue (LoCon / LoHa / LoKr / OFT — via eri-lycoris)
+models/                  per-model TrainableModel impls (see below)
+pipeline/                TrainingPipeline trait (prepare_inputs + compute_loss)
+sampler/                 per-model sampling for mid-training preview
+training/                training loop + features (see below)
+utils/
+video/                   video-specific helpers (ltx2 / wan22)
+```
+
+### `models/`
+
+One file per trainable model, each implementing `TrainableModel`:
+
+| File | Status |
+|---|---|
+| `klein.rs` | Klein 4B + 9B, working baseline. `timestep_shift=1.8` for LoRA |
+| `zimage.rs` | Z-Image base (NOT turbo), `cap_embedder = rms_norm` not layer_norm |
+| `chroma.rs` | Chroma 8.9B, ChromaTrainingModel |
+| `flux.rs` | FLUX.1, uses BlockOffloader for 24 GB box |
+| `ernie.rs` | ERNIE-Image 8B |
+| `anima.rs` | Anima 2B (= Cosmos Predict2 image-only, do not import) |
+| `qwenimage.rs` | Qwen-Image |
+| `sd35.rs` / `sdxl.rs` | SD3.5 / SDXL |
+| `ltx2.rs` | LTX-2 video |
+| `wan22.rs` + `wan22_fwd/` | Wan2.2 video (quant exception: FP8/AdamW8bit allowed) |
+| `acestep.rs` | ACE-Step audio LoRA |
+| `sensenova_u1.rs` + `_lora.rs` | SenseNova-U1 8B-MoT |
+
+### `training/` (the loop)
+
+| File / subdir | What |
+|---|---|
+| `mod.rs` | the training loop itself (`train(...)`) |
+| `features/` | optional features: `masked_loss`, `timestep_bias`, `caption_dropout`, `caption_aug`, `image_aug`, `tread`, `slider`, `multi_backend`, `ema_advanced`, `noise_modifiers`, `lr_schedule`, `loss_weight`, `validation`, `disk_check`, `health`, `sample_library`, `webhook`, `asymflow_loss` |
+| `training_features/` | unified config types: `optimizers`, `sampler`, `timestep_dist`, `ema` (consolidated 2026-05-10 across all trainers) |
+| `block_offload.rs` | per-layer weight streaming for large models on 24 GB |
+| `training_offload.rs` / `offload.rs` | activation + optimizer-state offload |
+| `checkpoint.rs` | save/resume |
+| `board.rs` | metrics → SQLite (`board.db`, `scalars` table) — trainers are silent on stdout without `RUST_LOG=info` |
+| `save_direct.rs` | LoRA save (PEFT/ai-toolkit format, all trainers, by design) |
+| `ema.rs` | parameter EMA |
+| `grad_coverage.rs` | grad-flow assertions, complements `flame_core::diagnostics::assert_grad_flow` |
+| `schedule.rs` | learning-rate schedules |
+| `progress.rs` / `logging.rs` | logs and tqdm-like progress |
+
+### `encoders/`
+
+Every text + VAE encoder used by any trainer lives here. Adding a new model
+means adding its tokenizer/encoder here OR reusing one (e.g. T5-XXL is shared
+across multiple). VAEs are first-class — encode happens in `prepare_*`, decode
+in `sample_*`.
+
+### `sampler/`
+
+Per-model sampling code used by `sample_*` binaries and mid-training preview.
+Separate from `flame-core`'s sampling primitives — these wire model + scheduler
++ VAE end-to-end.
+
+## 3. Where to start for common tasks
+
+| Task | Start here |
+|---|---|
+| Add a new trainer | `crates/eridiffusion-core/src/models/<name>.rs` + a `pipeline/` impl + `crates/eridiffusion-cli/src/bin/train_<name>.rs` + a flat `configs/<name>.json` |
+| Debug a training run | `RUST_LOG=info` (else silent stdout), then `board.db` scalars |
+| Grad-flow regression | `FLAME_ASSERT_GRAD_FLOW=1` + `crate::training::grad_coverage` |
+| OOM on 24 GB | `training/block_offload.rs` (per-layer streaming) + `training/training_offload.rs` (activations) |
+| Parity vs PyTorch trainer | per-model `bin/parity_<model>_*.rs` + `flame_core::parity::ParityHarness` |
+| Dataset prep OOM (~75 samples) | confirm `FLAME_ALLOC_POOL=0` set at `main()` start in the `prepare_*` bin |
+| Pre-fix Klein/ERNIE/Flux/SDXL/Z-Image LoRAs are invalid | HWC→CHW transpose bug fixed 2026-05-05 in all `prepare_*.rs`; pre-fix latents were std≈0.85 not ≈0.96 |
+| LoRA save format | `training/save_direct.rs` writes PEFT/ai-toolkit (intentional, not a bug) |
+| Convert LoRA between formats | `bin/convert_zimage_lora.rs` is the template |
+| Klein step-2 crash | resolved 2026-05-13: trainer auto-disables `FLAME_ALLOC_POOL` (mirrors `prepare_klein:194`) |
+
+## 4. Configs
+
+`configs/*.json` — flat directory of per-run configs (e.g. `klein9b_alina.json`,
+`eri2_chroma_lora.json`, `asymflux2_klein_lora.json`). NO per-model subdirs.
+Per-model flags surface here that aren't in code defaults;
+**grep the trainer + config in tandem when porting settings between models.**
+
+## 5. Reference / parity material
+
+`reference/` (165k lines) is read-only vendored Python — OneTrainer, ai-toolkit,
+and per-model official training scripts. Used for:
+- Cross-checking forward pass when a parity test diverges
+- Generating per-layer GPU-streaming parity captures
+- Confirming optimizer / scheduler semantics
+
+**Never edit `reference/`. Never `cargo`-include it. Never CPU-stream a parity
+reference — see CONTEXT.md / project memory: BF16 CPU vs CUDA diverge at cos=0.5
+per layer.**
+
+## 6. Gotchas (project-wide invariants)
+
+- **`flame-core` is the producer.** When N trainers share a bug, fix flame-core,
+  not N trainer workarounds. `.contiguous()` sprinkles are stopgaps only.
+- **Pure-Rust runtime.** Python is a dev tool (parity refs, debug scripts).
+  Never ship Python.
+- **Z-Image = base bf16, not turbo.** Turbo is separately distilled; sampling
+  expectations differ.
+- **Klein 9B is the proving ground after Phase 5d.** Do not propose 4B fallback
+  when 9B hits friction.
+- **Wan2.2 is the quant exception.** FP8 / AdamW8bit allowed on Wan only —
+  14B+14B doesn't fit FP16 on 24 GB. No-quant rule applies to Z-Image.
+- **LyCORIS LoKr `factor=N` is factored W2.** For full-W2 LoKr use
+  `--rank 1000 --lora-alpha 1000`; `--rank N --lokr-factor N` gives a dead
+  `w2_b=0` leaf.
+- **OneTrainer doesn't use fused kernels.** Don't blame fusion for trainer-level
+  slowness — investigate sync patterns first.
+- **LyCORIS overhead ≈ +2.1 s/step on zimage rank=8.** Benchmark against plain
+  `--algo lora` for apples-to-apples flame-core perf.
+- **`assert_grad_flow` checks step-1, not step-0.** Step 0 has expected
+  uninitialized-leaf fires; step 1 is the real signal.
+
+## 7. Output dir / paths convention
+
+- Sample output: `EriDiffusion-v2/output/<run>/` (per-trainer override in config)
+- Checkpoints: `EriDiffusion-v2/output/<run>/checkpoints/`
+- Cache: `EriDiffusion-v2/cache/` (encoded captions + latents from `prepare_*`)
+- Logs / scalars: `EriDiffusion-v2/output/<run>/board.db`
+- Configs read from: `EriDiffusion-v2/configs/*.json` (flat, no subdirs)
+
+## 8. Related docs
+
+- `EriDiffusion-v2/PARITY_SIMPLETUNER.md` — SimpleTuner-parity CLI flag matrix
+- `EriDiffusion-v2/README.md`
+- `EriDiffusion-v2/HANDOFF_*.md` — most recent handoff (`ls -t | head -3`)
+- `flame-core/MAP.md` — sibling map (tensor + autograd layer)
+- `inference-flame/MAP.md` — sibling map (inference of the same models)
+- **`graphinference/PLAN.md` + `graphinference/PORT_STATE.md`** — SerenityFlow-in-Rust port plan (decisions locked 2026-05-16, awaiting user go for Phase 1)
+- `/home/alex/EriDiffusion/.claude/port-docs/CONTEXT.md` — porting rules
+- `/home/alex/.claude/projects/-home-alex-EriDiffusion/memory/MEMORY.md` — auto-memory index
+
+## 9. Active vs legacy
+
+- `lora.rs` (project-owned LoRALinear) and `lycoris.rs` (eri-lycoris adapter)
+  coexist — different injection points, both are live.
+- `models/sensenova_u1.rs` vs `sensenova_u1_lora.rs` — base model + dedicated
+  LoRA wrapper, both live.
+- `models/wan22.rs` vs `wan22_fwd/` — main module + split-out forward; both live.
+- All `train_*.rs` binaries are current; no superseded trainers in tree.

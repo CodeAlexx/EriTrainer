@@ -1,0 +1,247 @@
+[package]
+name = "flame-core"
+version = "26.15.1"
+authors = ["Alex"]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/CodeAlexx/Flame"
+description = "Core tensor operations and autograd for FLAME"
+# Versioning: calendar-derived MAJOR.MINOR.PATCH = YEAR(YY).DAY.REV.
+# Bump MAJOR on year rollover, MINOR on any breaking ABI change
+# (modules added/removed, public fn signatures changed, behavior
+# contracts altered — env-var semantics, Drop ordering, etc).
+# 26.15.1 = first release after the R1a–R2c OT-static-slab redesign
+# (2026-05-15). See HANDOFF_2026-05-15_OT_STATIC_SLAB_REDESIGN.md
+# for breaking changes vs the pre-redesign 0.1.0 line.
+
+[dependencies]
+cudarc = { version = "0.11.9", default-features = false, features = ["driver", "cublas", "cublaslt", "nvrtc", "cuda-12050", "f16"] }
+half = { version = "2.3", features = ["num-traits"] }
+num-traits = "0.2"
+thiserror = "1.0"
+anyhow = "1.0"
+rand = "0.8"
+rand_distr = "0.4"
+lazy_static = "1.4"
+once_cell = "1.19"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1.0"
+memmap2 = "0.9"
+eri-safetensors = { path = "../EriDiffusion-v2/eri-safetensors" }
+image = "0.24"
+ctor = "0.2"
+cfg-if = "1.0"
+libc = "0.2"
+libloading = "0.8"
+log = "0.4"
+env_logger = { version = "0.11", default-features = false }
+smallvec = "1.11"
+cuda-runtime-sys = "0.3.0-alpha.1"
+pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
+numpy = { version = "0.22", optional = true }
+
+
+[features]
+# CUDA is required for all default builds; disable at your own risk.
+default = ["cuda", "bf16_u16", "cudnn", "shared_storage"]
+legacy_examples = []
+nvrtc = []
+cudnn = []        # Opt-in only
+dtype_trace = []
+# Phase 3 attention oracle gate
+attn_oracle = []
+# Phase 2 optional oracles
+norm_oracle = []
+layout_checks = []
+# Retain legacy/cuda toggles for compatibility
+legacy = []
+legacy_cpu_autograd = []
+legacy_full = []
+cuda = []
+heavy_kernels = ["cuda"]   # Opt-in for big custom kernels/NVRTC/cuDNN
+capi = []
+# Developer-only examples; never built unless explicitly enabled.
+dev-examples = []
+# Experimental: true BF16 GPU storage and BF16 GEMM
+bf16_u16 = []
+# Experimental: fused BF16 CUDA kernels (LayerNorm/AdaLN, etc.). Requires bf16_u16 + CUDA.
+bf16_kernels = ["cuda", "bf16_u16"]
+bf16_conv = ["cudnn", "bf16_u16"]
+# Experimental: store Adam moment buffers in BF16 and skip automatic FP32 grad upcast.
+true_bf16_optimizer_states = []
+# Experimental: allow borrowed BF16 device views + Lt matmul wrappers.
+borrowed_weights = ["cuda", "bf16_u16"]
+strict_bf16 = []         # Telemetry guards; safe to combine with or without CUDA/autograd features
+autograd_v4 = []
+# Experimental clean-sheet autograd v2 (PyTorch-style DAG). Off by default;
+# Phase 0 only adds the feature flag + an empty module. Phases 1-5 fill it.
+# See `docs/AUTOGRAD_V2_DESIGN_REVIEW_HANDOFF.md`.
+autograd_v2 = []
+sdpa = []                # Optional gating for attention helpers; leave off for minimal builds
+sdpa_debug = []
+shared_storage = []
+python = ["pyo3", "numpy"]
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+# Matched-config bench vs PyTorch (2026-05-12). Source lives outside the
+# flame-core tree so it can be co-located with the Python side and the
+# orchestrator scripts. Read EriDiffusion-v2/benches/matched_config/README.md.
+[[bin]]
+name = "matched_bench"
+path = "../EriDiffusion-v2/benches/matched_config/flame_side.rs"
+required-features = ["cuda"]
+
+# Kernel-count diff bench vs PyTorch (2026-05-12). Single transformer block,
+# forward+backward, designed to be profiled by `nsys profile --trace=cuda`.
+# Read EriDiffusion-v2/benches/kernel_count_diff/README.md.
+[[bin]]
+name = "block_count_bench"
+path = "../EriDiffusion-v2/benches/kernel_count_diff/flame_block_bin.rs"
+required-features = ["cuda"]
+
+# FA2 forward-kernel throughput bench (Phase 1, 2026-04). `harness = false`
+# because we use our own minimal timing harness — criterion has heavy startup
+# overhead relative to these sub-millisecond kernels.
+[[bench]]
+name = "fa2_forward"
+harness = false
+
+# Non-causal SDPA forward bench (2026-05, mojo-vs-flame attention comparison).
+[[bench]]
+name = "sdpa_noncausal_bench"
+harness = false
+
+# Activation-backward fused-vs-decomposed microbench (2026-04-18).
+[[bench]]
+name = "activation_bwd"
+harness = false
+
+# `.strides()` allocation microbench (2026-04-22). Baselines the heap cost
+# of returning Vec<usize>; post-SmallVec numbers go into the commit message.
+[[bench]]
+name = "strides_alloc"
+harness = false
+
+# TensorIterator silu dispatcher overhead (2026-04-22). Gate 6 of the
+# OffsetCalculator port: contig path through `silu_bf16_iter` must stay
+# within 5% of the direct `bf16_ops::silu_bf16` call on the primary
+# 4096×4096 shape. Strided (transpose-view) column is new capability.
+[[bench]]
+name = "silu_iter_alloc"
+harness = false
+
+# TensorIterator gelu dispatcher overhead (2026-04-22, session 2). Same
+# gate as silu — contig path through `gelu_bf16_iter` must stay within
+# 5% of the direct `bf16_ops::gelu_bf16` call.
+[[bench]]
+name = "gelu_iter_alloc"
+harness = false
+
+# Square session 3 — same gate as silu/gelu.
+[[bench]]
+name = "square_iter_alloc"
+harness = false
+
+# RMSNorm forward (BF16) — vec-vs-legacy comparison (2026-05-12). Toggled
+# via FLAME_RMS_NORM_LEGACY=1 env. Production shapes: zimage block 2560,
+# qknorm head_dim 128, klein block 4096, chroma block 3072.
+[[bench]]
+name = "rms_norm_vec"
+harness = false
+
+# LayerNorm backward (BF16) — vec-vs-legacy comparison (2026-05-12). Toggled
+# via FLAME_LAYER_NORM_LEGACY=1 env. Same shape coverage as rms_norm_vec.
+[[bench]]
+name = "layer_norm_vec"
+harness = false
+
+# BF16 slice leading-axis fast-path (cudaMemcpyAsync) vs generic kernel
+# (2026-05-12). Toggled via FLAME_SLICE_COPY_LEGACY=1.
+[[bench]]
+name = "slice_copy_bench"
+harness = false
+
+# Permute 0213/021 current-kernel bandwidth measurement (2026-05-12). Read-only
+# bench; used to decide whether tiled-transpose rewrite is worth the effort.
+[[bench]]
+name = "permute_bench"
+harness = false
+
+# SwiGLU current-kernel bandwidth measurement (2026-05-12). Read-only.
+[[bench]]
+name = "swiglu_bench"
+harness = false
+
+# SDPA causal: stream vs attention_impl entry points (2026-05-12).
+# Confirms whether the 1000x bench artifact is real perf or wrong-API.
+[[bench]]
+name = "sdpa_causal_bench"
+harness = false
+
+# RMSNorm inference path (cuda_ops_bf16::rms_norm_bf16) post-unification
+# verification (2026-05-12). Confirms inference now hits the vec kernel.
+[[bench]]
+name = "rms_norm_inference_bench"
+harness = false
+
+# LayerNorm forward (BF16) vec=4 vs legacy smem-tree. 2026-05-12.
+# Toggled via FLAME_LAYER_NORM_FWD_LEGACY=1.
+[[bench]]
+name = "layer_norm_fwd_bench"
+harness = false
+
+# GroupNorm forward stats kernel (BF16) vec=4 vs legacy. 2026-05-12.
+# Toggled via FLAME_GROUP_NORM_STATS_LEGACY=1.
+[[bench]]
+name = "group_norm_fwd_bench"
+harness = false
+
+# Tensor::to_dtype cast fast-path benchmark (BF16<->F32). 2026-05-12.
+[[bench]]
+name = "cast_bench"
+harness = false
+
+# Softmax lastdim BF16 — block_size right-sized for small cols. 2026-05-12.
+[[bench]]
+name = "softmax_bench"
+harness = false
+
+# Conv2d with cuDNN v7 algo cache. 2026-05-12.
+[[bench]]
+name = "conv2d_bench"
+harness = false
+
+# Add session 4 — first binary, same 5%-within gate.
+[[bench]]
+name = "add_iter_alloc"
+harness = false
+
+[[bench]]
+name = "dispatch_overhead"
+harness = false
+
+[build-dependencies]
+cbindgen = "0.26"
+cc = "1.0"
+
+[dev-dependencies]
+approx = "0.5"
+libm = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 2026-05-13 (Phase 5b follow-up): serialize tests that touch the v3
+# AUTOGRAD_CONTEXT process-global Mutex (src/autograd.rs:56). Replaces
+# the band-aid "single-test driver with N inner fns" pattern used in
+# tests/autograd_v2_bridge.rs and tests/autograd_v2_klein_parity.rs.
+# Per-test #[serial] attribute is one line and restores per-scenario
+# CI granularity. See HANDOFF_2026-05-13 §Known parallel-test flakes.
+serial_test = "3"
+
+# 2026-05-12 (launch-storm Phase 4): vendored cudarc 0.11.9 with the
+# bind_to_thread thread-local fast-path. Cuts cuCtxSetCurrent storm
+# from ~91k/step to ~1/thread/program. See cudarc-pinctx/src/driver/
+# safe/threading.rs for the one-file patch and rationale.
+[patch.crates-io]
+cudarc = { path = "../cudarc-pinctx" }

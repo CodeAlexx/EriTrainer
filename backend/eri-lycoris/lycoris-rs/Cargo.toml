@@ -1,0 +1,29 @@
+[package]
+name = "lycoris-rs"
+version = "0.1.0"
+edition = "2021"
+authors = ["Alex"]
+license = "MIT"
+description = "Rust port of LyCORIS - LoRA algorithms (LoRA, LoHa, LoKr) with BF16 storage and FP32 compute"
+
+[dependencies]
+flame-core = { path = "../../flame-core" }
+cudarc = { version = "0.11.9", features = ["driver", "cublas", "cublaslt", "nvrtc", "cuda-12050", "f16"] }
+half = { version = "2.3", features = ["num-traits"] }
+num-traits = "0.2"
+thiserror = "1.0"
+anyhow = "1.0"
+
+[dev-dependencies]
+approx = "0.5"
+
+[features]
+default = ["bf16"]
+bf16 = ["flame-core/bf16_u16"]
+cudnn = ["flame-core/cudnn"]
+
+# Mirror flame-core: route cudarc through the vendored cudarc-pinctx so the
+# `install_external_ptr_hook` symbol resolves when flame-core sources are
+# compiled inside this workspace. See flame-core/Cargo.toml for the rationale.
+[patch.crates-io]
+cudarc = { path = "../../cudarc-pinctx" }

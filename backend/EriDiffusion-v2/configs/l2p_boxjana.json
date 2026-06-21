@@ -1,0 +1,29 @@
+{
+  "__version": 10,
+  "base_model_name": "L2P (Tencent T2I-L2P, pixel-space Z-Image-Turbo)",
+  "training_method": "LORA",
+  "peft_type": "LORA",
+
+  "steps": 3000,
+  "learning_rate": 1e-4,
+  "lora_rank": 16,
+  "lora_alpha": 16.0,
+
+  "clip_grad_norm": 1.0,
+  "gradient_checkpointing": "ON",
+  "save_every": 1000,
+
+  "timestep_shift": 1.0,
+
+  "optimizer": {
+    "name": "adamw"
+  },
+
+  "validation_prompts_file": "configs/l2p_boxjana_prompts.json",
+  "sample_every": 500,
+  "sample_size": 1024,
+  "sample_steps": 30,
+  "sample_cfg": 2.0,
+  "sample_shift": 3.0,
+  "sample_seed": 42
+}

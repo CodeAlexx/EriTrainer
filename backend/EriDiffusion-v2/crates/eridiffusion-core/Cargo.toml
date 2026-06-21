@@ -1,0 +1,40 @@
+[package]
+name = "eridiffusion-core"
+version = "0.1.0"
+edition = "2021"
+description = "EriDiffusion Rust port — core training framework"
+
+[dependencies]
+flame-core = { workspace = true }
+lycoris-rs = { workspace = true }
+clap = { workspace = true }
+cudarc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+rand = { workspace = true }
+rand_distr = { workspace = true }
+image = { workspace = true }
+safetensors = { workspace = true }
+parking_lot = { workspace = true }
+lazy_static = { workspace = true }
+memmap2 = "0.9"
+rusqlite = { version = "0.31", features = ["bundled"] }
+# Phase 7: GPU health monitoring (NVML) + webhook notifications (sync HTTP).
+# `nvml-wrapper` is a thin libnvidia-ml binding, no transitive bloat.
+# `ureq` is a sync HTTP client — chosen over `reqwest` to avoid pulling tokio.
+nvml-wrapper = "0.10"
+ureq = { version = "2", default-features = false, features = ["json", "tls"] }
+# Used by encoders/umt5.rs for FP16-on-disk → BF16 conversion path.
+half = "2"
+# Used by sensenova_u1::promote_unfreeze for v16c-style regex-driven
+# trainable-parameter promotion (LoRA + partial-FT recipes).
+regex = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

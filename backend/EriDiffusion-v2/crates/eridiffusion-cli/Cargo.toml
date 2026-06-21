@@ -1,0 +1,233 @@
+[package]
+name = "eridiffusion-cli"
+version = "0.1.0"
+edition = "2021"
+description = "EriDiffusion Rust port — CLI"
+autobins = false
+
+[[bin]]
+name = "train_acestep"
+path = "src/bin/train_acestep.rs"
+
+[[bin]]
+name = "train_anima"
+path = "src/bin/train_anima.rs"
+
+[[bin]]
+name = "train_asymflow"
+path = "src/bin/train_asymflow.rs"
+
+[[bin]]
+name = "train_chroma"
+path = "src/bin/train_chroma.rs"
+
+[[bin]]
+name = "train_ernie"
+path = "src/bin/train_ernie.rs"
+
+[[bin]]
+name = "train_flux"
+path = "src/bin/train_flux.rs"
+
+[[bin]]
+name = "train_hidream_o1"
+path = "src/bin/train_hidream_o1.rs"
+
+[[bin]]
+name = "train_ideogram"
+path = "src/bin/train_ideogram.rs"
+
+[[bin]]
+name = "train_klein"
+path = "src/bin/train_klein.rs"
+
+[[bin]]
+name = "train_l2p"
+path = "src/bin/train_l2p.rs"
+
+[[bin]]
+name = "train_ltx2"
+path = "src/bin/train_ltx2.rs"
+
+[[bin]]
+name = "train_qwenimage"
+path = "src/bin/train_qwenimage.rs"
+
+[[bin]]
+name = "train_sd35"
+path = "src/bin/train_sd35.rs"
+
+[[bin]]
+name = "train_sdxl"
+path = "src/bin/train_sdxl.rs"
+
+[[bin]]
+name = "train_slider_klein"
+path = "src/bin/train_slider_klein.rs"
+
+[[bin]]
+name = "train_u1"
+path = "src/bin/train_u1.rs"
+
+[[bin]]
+name = "train_wan22"
+path = "src/bin/train_wan22.rs"
+
+[[bin]]
+name = "train_zimage"
+path = "src/bin/train_zimage.rs"
+
+[[bin]]
+name = "prepare_anima"
+path = "src/bin/prepare_anima.rs"
+
+[[bin]]
+name = "prepare_asymflow"
+path = "src/bin/prepare_asymflow.rs"
+
+[[bin]]
+name = "prepare_chroma"
+path = "src/bin/prepare_chroma.rs"
+
+[[bin]]
+name = "prepare_ernie"
+path = "src/bin/prepare_ernie.rs"
+
+[[bin]]
+name = "prepare_flux"
+path = "src/bin/prepare_flux.rs"
+
+[[bin]]
+name = "prepare_hidream_o1"
+path = "src/bin/prepare_hidream_o1.rs"
+
+[[bin]]
+name = "prepare_ideogram"
+path = "src/bin/prepare_ideogram.rs"
+
+[[bin]]
+name = "prepare_klein"
+path = "src/bin/prepare_klein.rs"
+
+[[bin]]
+name = "prepare_l2p"
+path = "src/bin/prepare_l2p.rs"
+
+[[bin]]
+name = "prepare_ltx2"
+path = "src/bin/prepare_ltx2.rs"
+
+[[bin]]
+name = "prepare_qwenimage"
+path = "src/bin/prepare_qwenimage.rs"
+
+[[bin]]
+name = "prepare_sd35"
+path = "src/bin/prepare_sd35.rs"
+
+[[bin]]
+name = "prepare_sdxl"
+path = "src/bin/prepare_sdxl.rs"
+
+[[bin]]
+name = "prepare_wan22"
+path = "src/bin/prepare_wan22.rs"
+
+[[bin]]
+name = "prepare_zimage"
+path = "src/bin/prepare_zimage.rs"
+
+[[bin]]
+name = "sample_anima"
+path = "src/bin/sample_anima.rs"
+
+[[bin]]
+name = "sample_chroma"
+path = "src/bin/sample_chroma.rs"
+
+[[bin]]
+name = "sample_ernie"
+path = "src/bin/sample_ernie.rs"
+
+[[bin]]
+name = "sample_flux"
+path = "src/bin/sample_flux.rs"
+
+[[bin]]
+name = "sample_klein"
+path = "src/bin/sample_klein.rs"
+
+[[bin]]
+name = "sample_ltx2"
+path = "src/bin/sample_ltx2.rs"
+
+[[bin]]
+name = "sample_qwenimage"
+path = "src/bin/sample_qwenimage.rs"
+
+[[bin]]
+name = "sample_qwenimage_edit"
+path = "src/bin/sample_qwenimage_edit.rs"
+
+[[bin]]
+name = "sample_sd35"
+path = "src/bin/sample_sd35.rs"
+
+[[bin]]
+name = "sample_sdxl"
+path = "src/bin/sample_sdxl.rs"
+
+[[bin]]
+name = "sample_u1"
+path = "src/bin/sample_u1.rs"
+
+[[bin]]
+name = "sample_wan22"
+path = "src/bin/sample_wan22.rs"
+
+[[bin]]
+name = "sample_zimage"
+path = "src/bin/sample_zimage.rs"
+
+[[bin]]
+name = "convert_zimage_lora"
+path = "src/bin/convert_zimage_lora.rs"
+
+[[bin]]
+name = "decode_cached_anima"
+path = "src/bin/decode_cached_anima.rs"
+
+[[bin]]
+name = "selfconsist_ckpt"
+path = "src/bin/selfconsist_ckpt.rs"
+
+[[bin]]
+name = "vae_bisect"
+path = "src/bin/vae_bisect.rs"
+
+[dependencies]
+eritrainer-registry = { path = "../eritrainer-registry" }
+eridiffusion-core = { path = "../eridiffusion-core" }
+flame-core = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.10"
+image = "0.24"
+md5 = "0.7"
+rand = "0.8"
+rand_distr = "0.4"
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+serde_json = "1"
+safetensors = { workspace = true }
+cudarc = { workspace = true }
+
+[features]
+# Gate-on Stage 6a (2026-05-30): autograd_v2 is now a DEFAULT feature so the
+# v2 `backward_v2()` bridge compiles into the normal build. Klein routes
+# through v2 by default (proven within BF16 tolerance vs v3); other trainers
+# still default to v3 unless they pass --use-autograd-v2. v3 stays compiled
+# and reachable (Klein: --use-autograd-v3). Use --no-default-features to
+# exclude the v2 bridge entirely.
+default = ["autograd_v2"]
+autograd_v2 = ["flame-core/autograd_v2"]

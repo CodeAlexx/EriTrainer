@@ -1,0 +1,19 @@
+{
+  "prompts": [
+    {
+      "prompt": "vrtlEri2, The image depicts a young woman with long, dark wavy hair standing on a sandy beach, the clear blue ocean and a few white clouds behind her, soft natural sunlight on her skin, a relaxed and carefree mood, detailed skin texture",
+      "negative": "",
+      "seeds": [42]
+    },
+    {
+      "prompt": "vrtlEri2, The image features a young woman with long, dark wavy hair in an intimate indoor photo shoot, soft diffused window light casting gentle shadows, a plain light-colored wall background, her gaze warm and direct, quiet intimate mood, detailed skin texture",
+      "negative": "",
+      "seeds": [42]
+    },
+    {
+      "prompt": "vrtlEri2, A close-up headshot of a young woman with long, dark wavy hair framing her face, fair skin and delicate features, soft natural lighting, neutral background, sharp focus on her eyes, calm and contemplative mood",
+      "negative": "",
+      "seeds": [42]
+    }
+  ]
+}

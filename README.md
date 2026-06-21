@@ -1,16 +1,25 @@
 # EriTrainer
 
-A native [egui](https://github.com/emilk/egui) training UI for the EriDiffusion-v2
-Rust diffusion trainers. EriTrainer mirrors the look and behavior of the Mojo
-`serenity-trainer` UI (whose tab layout in turn mirrors OneTrainer) and **launches
-the existing `train_*` trainer binaries unchanged** — it is a launcher/monitor, not
-a new trainer.
+A native [egui](https://github.com/emilk/egui) training UI plus local Rust
+trainer backend for EriDiffusion. EriTrainer mirrors the look and behavior of
+the Mojo `serenity-trainer` UI (whose tab layout in turn mirrors OneTrainer) and
+now owns a copied EDv2/flame-core backend under `backend/`.
 
 ## Design
 
-- **Launcher, not a trainer.** EriTrainer writes/forwards a run configuration, spawns
-  the selected `train_<model>` binary as a subprocess, and tails its stdout. It has
-  **no dependency on the training stack** (no CUDA/libtorch needed to build the UI).
+- **UI separated from backend.** The egui app still builds without linking the
+  CUDA/flame-core stack, but it launches the local backend by default:
+  `backend/EriDiffusion-v2` → `eridiffusion-core` → local `flame-core`.
+- **Unified trainer front door.** The UI launches the local `train` dispatcher,
+  which resolves the model through a lightweight registry and forwards to the
+  existing per-model trainer shim while the OneTrainer-style setup/loop migration proceeds.
+- **OneTrainer-style layer split.** The shared trainer pipeline owns lifecycle,
+  config/preflight, cache discovery, runtime/device setup, metrics, progress,
+  and save/sample orchestration. Model-specific code owns model load, cache
+  tensor schema, forward/loss, sampler details, and checkpoint key layout.
+- **No inference runtime dependency.** Trainer sampling/model helper code belongs
+  in `eridiffusion-core` / `eridiffusion-core::sampler`; default trainer crates
+  should not depend on `inference-flame`.
 - **Monitor contract.** Every EriDiffusion-v2 trainer prints one progress line per step:
   ```
   [<tag>] step N/T | epoch e/E | loss X.XXXX | grad_norm X.XXXX | X.Xs/step | elapsed H:MM:SS | ETA H:MM:SS
@@ -39,11 +48,12 @@ cargo run            # opens the UI (eframe + egui, glow backend)
 cargo test           # unit tests (progress parser, model presets, launch command)
 ```
 
-To launch training you also need the EriDiffusion-v2 trainers built and a prepared
-latent cache. EriTrainer resolves the trainer binary from
-`$ERITRAINER_EDV2_DIR/target/{release,debug}/train_<model>` (default
-`/home/alex/EriDiffusion/EriDiffusion-v2`), falling back to `cargo run`. The EDv2
-binaries link libtorch, so EriTrainer puts it on `LD_LIBRARY_PATH`
+To launch training you also need a prepared latent cache and the model weights.
+EriTrainer resolves trainer binaries from
+`$ERITRAINER_EDV2_DIR/target/{release,debug}/train` (default
+`./backend/EriDiffusion-v2`), falling back to `cargo run --bin train` in the
+current app profile. The `train` dispatcher itself does not link the CUDA stack;
+the selected model trainer does. The trainer backend links libtorch, so EriTrainer puts it on `LD_LIBRARY_PATH`
 (`$ERITRAINER_LIBTORCH`, default `/home/alex/libs/libtorch/lib`).
 
 In the UI: pick the model on the **Model** tab (Model Type / Architecture apply a
@@ -53,11 +63,26 @@ and the schedule on **Training**, then **Start training**.
 ## Status
 
 - Shell, tabs, config model, live rail, and system metrics: built.
-- **9 models** wired and verified end-to-end against their real binaries (each: a
-  short smoke run produced finite/decreasing loss + a LoRA checkpoint, and the
-  trainer's progress line is covered by a parser test): klein, sdxl, zimage,
-  chroma, ernie, anima, hidream-o1, sd35, l2p. Each `train_*` has its own CLI —
-  see the per-model table in `MAP.md`.
+- Local backend copied into `backend/` with local `flame-core`,
+  `eri-lycoris/lycoris-rs`, and pinned `cudarc`.
+- Lightweight dispatcher package `eritrainer-dispatch` and shared
+  `eritrainer-registry` added.
+- `inference-flame` removed from the migrated default trainer dependency graph;
+  HiDream-O1 helpers, AsymFlow math, and Oklab color math are local core modules.
+- **18 trainer models** registered behind the local `train --model <id>` dispatcher:
+  acestep, anima, asymflow, chroma, ernie, flux, hidream-o1, ideogram4, klein,
+  l2p, ltx2, qwenimage, sd35, sdxl, slider-klein, u1, wan22, zimage. Each
+  `train_*` still has its own model-specific CLI; the dispatcher and UI give them
+  one front door.
+- **Shared trainer pipeline migration:** trainer lifecycle code now lives in
+  `trainer_pipeline` / `trainer_common` for logging, progress/timing, loss
+  accounting, optimizer stepping, gradient policy/clipping helpers, EMA swaps, and
+  checkpoint saves. Model-specific files keep model load, cache schema,
+  forward/loss, sampling, and checkpoint key details.
+- **GPU smoke coverage:** SDXL was re-smoked through the local dispatcher on
+  2026-06-21: `train --model sdxl` ran one step with finite loss/grad norm and
+  saved both EDv2 and ComfyUI/Kohya LoRA files. Other models retain their prior
+  verification status or compile-only status as listed in `MAP.md`.
 - **Runner `--config` generation**: models whose trainer requires `--config`
   (klein/ernie/anima/sd35) auto-write an EDv2 `TrainConfig` JSON from the form
   when you haven't supplied a Run Config path.
@@ -65,8 +90,8 @@ and the schedule on **Training**, then **Start training**.
   `~/.config/eritrainer/configs/<run_name>.json` and reload any saved config.
 - **File/folder pickers**: path fields (Base Model, Run Config, Cache, Workspace,
   Destination, Dataset, Sample Dir) have a native "Browse…" button (rfd).
-- Remaining: the deferred/video models (flux, qwen, wan22, ltx2, …); a polished
-  live-GUI pass.
+- Remaining: a polished live-GUI pass and broader real GPU smoke coverage for
+  the models that have only been compile-verified in this repository.
 
 See `MAP.md` for the code map + add-a-model recipe and `ERITRAINER_PLAN.md` for the
 full build spec.

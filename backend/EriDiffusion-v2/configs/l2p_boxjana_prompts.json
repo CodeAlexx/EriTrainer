@@ -1,0 +1,7 @@
+{
+  "prompts": [
+    { "prompt": "box1jana standing by a lake at night, white blouse, smiling, photo", "negative": "", "seeds": [42] },
+    { "prompt": "box1jana in a garden, cream blouse, dark hair, soft sunlight", "negative": "", "seeds": [42] },
+    { "prompt": "box1jana portrait, looking at camera, studio lighting", "negative": "", "seeds": [42] }
+  ]
+}

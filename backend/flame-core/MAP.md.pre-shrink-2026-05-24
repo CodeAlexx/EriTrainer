@@ -1,0 +1,127 @@
+# flame-core MAP
+
+Wayfinding for a cold-start session. See `CLAUDE.md` (this directory) for hard
+rules and `docs/FLAME_README.md` for the docs index. This file is the
+"where does X live" cheat sheet.
+
+## 1. Entry points
+
+- Library root: `src/lib.rs`. Re-exports: `Tensor`, `TensorId`, `DType`,
+  `Device`, `Shape`, `Error`/`Result`, `Parameter` (alias `Var`),
+  `GradientMap`, `AutogradContext`, `Op`, `Module` trait, `nn::{Linear,
+  Conv2d, LayerNorm, Embedding, AdamW}`. Auto-runs `init()` via `#[ctor]`
+  (reads `FLAME_DEFAULT_DTYPE`, `FLAME_FORCE_CUDNN`).
+- Crate version: `26.15.1`. Pinned by `EriDiffusion-v2` with `version =
+  "=26.15.1"` — bumping breaks trainers.
+- Downstream crates:
+  - `inference-flame` — features `["cuda","bf16_u16","cudnn","shared_storage"]`.
+  - `EriDiffusion-v2` — trainers (Klein, Z-Image, Chroma, Qwen, Anima, …).
+- C API: `src/capi.rs` (feature `capi`, off by default). Python bindings:
+  `src/python/` (feature `python`, off by default).
+
+## 2. Top-level `src/` layout
+
+| Path | Purpose |
+|---|---|
+| `lib.rs`, `config.rs`, `device.rs`, `dtype.rs`, `error.rs`, `shape.rs` | Crate spine, default-dtype/cuDNN toggles, `Device`, `DType`, `Shape`. |
+| `tensor.rs`, `tensor/contracts.rs`, `tensor_storage.rs`, `tensor_ext.rs`, `tensor_narrow.rs`, `tensor_ops_extended.rs`, `tensor_ops_missing.rs` | `Tensor` struct, storage, contracts, narrow/view ops, ergonomic extensions. |
+| `tensor_iterator/` | PyTorch-style dispatch registry for BF16 kernels (Phase 3 scaffold, registered in `lib.rs` ctor). |
+| `autograd.rs` (+ `autograd/policy.rs`) | **Live** autograd. Global tape, `AutogradContext`, `Op` enum (~47 variants). |
+| `autograd_v2/`, `autograd_v3.rs`, `autograd_v4/`, `autograd_simple.rs`, `autograd_debug.rs`, `autograd_engine.rs`, `autograd_ops.rs`, `autograd_ops_complete.rs` | Legacy / experimental. See §3. |
+| `gradient.rs`, `gradient_clip.rs`, `gradient_checkpointing.rs`, `diagnostics.rs`, `parity.rs` | `GradientMap`, clip, checkpoint; `diagnostics::assert_grad_flow`; `parity::ParityHarness`. |
+| `parameter.rs`, `linear.rs`, `embedding.rs`, `layer_norm.rs`, `group_norm.rs`, `norm.rs`, `conv.rs`, `conv1d.rs`, `conv3d.rs`, `conv3d_bf16.rs`, `pooling.rs`, `upsampling.rs`, `activations.rs`, `lora.rs`, `vae/` | `nn`-style modules. `conv::Conv2d` is canonical conv2d. |
+| `attention/` (`mod.rs`, `sdpa.rs`, `sdpa_legacy.rs`, `rope.rs`, `sliding_window_mask.rs`), `sdpa.rs`, `sdpa_legacy.rs`, `sage_attention.rs` | SDPA dispatchers, RoPE, masks. **No Flash Attention port lives here.** |
+| `ops/` | High-level op surface: `attn.rs`, `gemm.rs`, `gemm_bf16.rs`, `grouped_mm.rs`, `moe_routing.rs`, `nucleus_moe.rs`, `token_choice_routing.rs`, `fused_inference.rs`, `fused_gated_scatter_add.rs`, `reduce.rs`, `broadcast.rs`, `cast.rs`, `tile.rs`, `deinterleave.rs`, `elt.rs`, `grad_norm.rs`, `multi_tensor.rs`, `conv2d*.rs`, `cuda/`. |
+| `cuda/` | Build-time `.cu` kernels (cuBLASLt, cuDNN SDPA, fused_*.cu, FP8 quant, grouped_mm, PyTorch flash shim, fused_linear3d, fused_rms_norm, fused_modulate, fused_norm_modulate, fused_residual_gate). FFI in `cuda/ffi.rs`. |
+| `kernels/` | NVRTC kernels: `adaln.rs`, `geglu_kernels.cu`, `rope_kernels.cu`, `sdpa_kernels.cu`, `mul_bwd_bf16.cu`. |
+| `cuda_kernels.rs`, `cuda_kernels_gpu.rs`, `cuda_kernel_compiler.rs`, `cuda_kernel_sources.rs`, `cuda_ops.rs`, `cuda_ops_bf16.rs`, `cuda_ops_ffi.rs`, `cuda_gradient_ops.rs`, `cuda_conv2d*.rs`, `kernel_launcher.rs` | NVRTC compile, dispatch, F32 (`CudaKernels`) + BF16 (`cuda_ops_bf16`) op surfaces. |
+| `bf16_support.rs`, `bf16_ops.rs`, `bf16_elementwise.rs`, `bf16_convert.rs`, `bf16_factories.rs`, `bf16_reduce.rs`, `bf16_normal.rs`, `bf16_clamp.rs`, `fp16.rs`, `mixed_precision.rs` | BF16/FP16 primitives. `bf16_ops` is the live inference op family. |
+| `cudnn/` | cuDNN wrappers: `handle.rs`, `descriptors.rs`, `algorithms.rs`, `conv2d.rs`, `conv3d.rs`, `matmul.rs`, `matmul_simple.rs`, `norm.rs`, `activation.rs`, `linear.rs`. Feature `cudnn`. |
+| `blas.rs` | cuBLAS / cuBLASLt entry. `cuda/device_lt.rs` holds the LT handle. |
+| `cuda_alloc_pool.rs`, `memory_pool.rs`, `pinned.rs`, `pinned_pool.rs`, `staging.rs`, `ring_alloc/`, `static_slab_v2.rs`, `external_memory.rs` | Device + pinned host allocation. `FLAME_ALLOC_POOL=0` disables the pool (required for dataset-prep bins; see Gotchas). |
+| `activation_offload.rs`, `offload/` (`manager.rs`, `planner.rs`, `strategy*`, `state.rs`, `telemetry.rs`, `transfer_benchmark.rs`) | `BlockOffloader` + activation offload — large-model weight streaming on commodity GPUs. |
+| `adam.rs`, `adam8bit_kernel.rs`, `sgd/`, `int8_weight_only_qt_kernel.rs` | Optimizers + quantized state. |
+| `loss.rs`, `samplers.rs`, `regularization.rs`, `rng/` | Loss, schedulers/samplers, weight decay, RNG. |
+| `serialization.rs` | safetensors I/O. |
+| `image_ops_nhwc.rs`, `pooling_impl.rs`, `fused_kernels.rs` | Vision/fused helpers. |
+| `telemetry.rs`, `perf_telemetry.rs`, `logging.rs`, `env_flags.rs`, `debug_device.rs`, `debug_finite.rs`, `strict.rs` | Counters, env flags, strict-mode guard, finite checks. |
+| `ffi/`, `borrowed/`, `structured/`, `saved_ref.rs` | C FFI helpers, borrowed-weight views (feature `borrowed_weights`), structured tensor ops, autograd saved-ref path. |
+| `bin/` | 13 dev binaries: `op_bench_flame`, `perf_test`, `test_backward`, `test_grad_propagation`, `flame_backward_probe`, etc. Not shipped. |
+| `tests/` | In-crate tests (separate from top-level `tests/` dir). |
+
+Other dirs at repo root: `cuda/`, `kernels/` (more `.cu` build inputs), `benches/`,
+`benchmarks/`, `tests/`, `inference-test/`, `scripts/`, `third_party/`, `unused/`.
+
+## 3. Active vs legacy autograd
+
+| Module | Status | Notes |
+|---|---|---|
+| `autograd.rs` | **Live** — `pub use autograd::{AutogradContext, Op}` in `lib.rs:237` | Global mutex-protected tape, `TapeEntry { output_id, op, saved_tensors, saved_refs }`. Documented in `docs/FLAME_AUTOGRAD_INTERNALS.md`. |
+| `autograd_v3.rs` | Compiled but unused as primary | `lib.rs:177` comment says "Primary autograd engine" — stale; the re-export comes from `autograd`, not v3. Treat as legacy. |
+| `autograd_v2/` | Feature `autograd_v2` (off by default) | Burn-style engine. Bridge tests at `tests/autograd_v2_*.rs`. |
+| `autograd_v4/` | Feature `autograd_v4` (off by default) | Experimental Burn-style. `mod.rs` says "Experimental … feature-gated". |
+| `autograd_simple.rs`, `autograd_engine.rs`, `autograd_ops.rs`, `autograd_ops_complete.rs`, `autograd_debug.rs` | Dead/superseded but compiled | Kept for reference; new work goes in `autograd.rs`. |
+
+Don't add new ops to v3/v4. Add `Op` variants to `autograd.rs` and a backward
+arm to its `backward` dispatch.
+
+## 4. Where to start for common tasks
+
+- **Add a CUDA kernel (BF16 inference)**: write NVRTC source as `const &str` in
+  `src/bf16_*.rs` or `src/cuda_kernels*.rs`; dispatch from `cuda_ops_bf16.rs`;
+  log it in `docs/FLAME_KERNELS.md`.
+- **Add a CUDA kernel (cuBLASLt/cuDNN/.cu)**: drop `.cu` in `src/cuda/`, list
+  it in `build.rs`, expose via `src/cuda/ffi.rs`, wrap in Rust under `ops/`.
+- **Add op autograd**: append variant to `autograd.rs::Op`, save tensors via
+  `record_op`, implement backward arm. Internals: `docs/FLAME_AUTOGRAD_INTERNALS.md`.
+- **Debug "LoRA-B stays zero" / dead grads**: `FLAME_ASSERT_GRAD_FLOW=1` +
+  `diagnostics::assert_grad_flow(&grads, &names)` at step 1 (not step 0).
+  See `docs/TRAINER_DIAGNOSTICS.md`.
+- **Parity-check a port vs PyTorch**: `flame_core::parity::ParityHarness`
+  (per-layer cos). Reference Python streams layers; never CPU-vs-GPU compare
+  (memory: `pytorch_cpu_vs_cuda_bf16`).
+- **Find a symbol**: `docs/FLAME_INDEX.md` (`symbol → file:line`, marks ⭐ live
+  / ⚠️ legacy).
+- **Find a kernel**: `docs/FLAME_KERNELS.md`.
+- **Perf work**: `docs/SPEED_CONTRACT.md`. Mirror PyTorch ATen
+  (`aten/src/ATen/native/cuda`) — don't guess.
+
+## 5. Gotchas (project-wide invariants)
+
+- `Tensor::cat` doesn't guarantee contiguous output. Add `.contiguous()`
+  before any conv or kernel that strides-naively. Open fix:
+  `project_flame_fixit_cat_contig`.
+- `Tensor::narrow` returns a zero-copy view that pins parent storage. Use
+  `narrow_owning` if you need ownership without the pin (TurboVAED OOM root cause).
+- `Tensor::softmax` BF16 fast path is **last-dim only**. Non-last-dim falls
+  off to a 5-step pipeline.
+- Two silu/gelu implementations exist. `Tensor::silu` calls `bf16_ops::`, not
+  `cuda/cuda_ops.cu::fc_silu_bf16`. Edit the wrong one and the change is a no-op.
+- `cuda_ops_bf16::group_norm_bf16` is **NHWC**, not NCHW.
+- `conv1d` k=1 fast path is broken on non-contig permuted inputs — hand-roll
+  with explicit `.contiguous()`.
+- NVRTC has no `<cfloat>` / `<float.h>`. Use literal constants. `#pragma unroll`
+  doesn't survive macro expansion — use `_Pragma("unroll")`.
+- `cudarc` is pinned at 0.11.9. **No cuSOLVER bindings** — any GPU linalg
+  (SVD/QR) needs an 8-version upgrade or hand-written FFI.
+- **No Flash Attention** in this repo. flame-core has cuDNN SDPA + WMMA reference
+  only. Don't propose FA2/FA3.
+- **No F32 fallbacks in inference paths.** If BF16 path missing, write one.
+- `FLAME_ALLOC_POOL=0` required for any dataset-prep binary (pool leaks ~1 GB/sample).
+- BF16 fused kernels must register autograd backward, or LoRA-B stays at zero.
+  Default-on `FLAME_ASSERT_GRAD_FLOW=1` when running trainers.
+- Legacy paths to avoid in new code: `sdpa_legacy`, `cuda_tensor*`,
+  `cuda_kernels::CudaKernels` (F32 training), standalone `attention/sdpa.rs::LayerNorm`.
+
+## 6. Related docs
+
+- `CLAUDE.md` — session-entry rules, hard constraints, two build pipelines.
+- `TENETS.md` — design principles (fix-the-primitive, API-makes-right-easy).
+- `docs/FLAME_README.md` — index to the LLM-curated docs set.
+- `docs/FLAME_INDEX.md` — flat `symbol → file:line` lookup with ⭐/⚠️ marks.
+- `docs/FLAME_MODULES.md` — one paragraph per public module.
+- `docs/FLAME_KERNELS.md` — every CUDA kernel with launch configs + perf notes.
+- `docs/FLAME_CONVENTIONS.md` — naming, layout, dispatch patterns, gotchas.
+- `docs/FLAME_AUTOGRAD_INTERNALS.md` — tape, `TapeEntry`, `Op`, backward dispatch.
+- `docs/TRAINER_DIAGNOSTICS.md` — `assert_grad_flow` + `ParityHarness` wiring.
+- `docs/SPEED_CONTRACT.md` — audit gates for perf work.

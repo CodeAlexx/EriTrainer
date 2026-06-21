@@ -1,0 +1,41 @@
+# Klein 9B canonical baseline
+# Update via /baseline-set after a successful run.
+
+model = "klein9b"
+config_canonical = "configs/klein9b_alina.json"
+last_validated = "2026-05-13"
+flame_core_commit = "1f5365c"
+# WARNING (2026-05-24): current flame-core HEAD is b50ab5f, and
+# project_all_trainers_broken_2026-05-24 documents that klein/zimage/ernie/
+# anima/qwen-image all collapse at b50ab5f. The numbers below are valid
+# AGAINST 1f5365c. They are NOT valid as a regression check against
+# current HEAD until that regression is fixed. /train-launch preflight
+# should flag this commit drift.
+status_against_current_head = "stale — regression at b50ab5f unfixed"
+
+[step_1]
+loss = 1.1217
+
+[steady_state]
+loss_mean_last_30 = 0.7549
+step_seconds = 4.4
+# gpu_util_percent intentionally unset — historical 78% number was on plain
+# LoRA on 3090 Ti; varies per box.
+
+[grad_flow]
+fires_at_step_0 = "expected"     # uninitialized-leaf, ignore
+fires_at_step_1_or_later = 0
+
+[lora_health]
+# Klein 9B run from 2026-05-13 was rank=8 plain LoRA on Alina dataset;
+# LoRA-B nonzero ratio not separately measured but trainer converged.
+b_nonzero_ratio = 0.99
+at_step = "end"
+
+[known_quirks]
+notes = [
+  "FLAME_ALLOC_POOL=0 required at trainer start — auto-disabled in train_klein:main (mirrors prepare_klein:194)",
+  "timestep_shift = 1.8 is the LoRA sweet spot (sharper than default 1.0; OT/our previous default)",
+  "step-1 loss is per-step lottery driven by timestep distribution sampler change (Box-Muller→Ziggurat). 30-step mean matches 2026-05-08 baseline 0.7374 — within BF16 noise (Δ=2.4e-7 across v2/v3).",
+  "Use plain --algo lora for perf comparison; LyCORIS LoKr adds ~2.1 s/step on 3090 Ti.",
+]
