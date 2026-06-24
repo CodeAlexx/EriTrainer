@@ -13,3 +13,6 @@ backend/**/*.safetensors
 
 # Training outputs (LoRAs, samples) stay local — never commit
 output/
+
+# Parity oracle dumps (large generated reference tensors) stay local
+trainer/parity/**/*.safetensors

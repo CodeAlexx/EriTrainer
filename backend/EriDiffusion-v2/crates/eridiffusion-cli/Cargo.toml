@@ -6,6 +6,30 @@ description = "EriDiffusion Rust port — CLI"
 autobins = false
 
 [[bin]]
+name = "parity_ideogram4_lora_grad"
+path = "src/bin/parity_ideogram4_lora_grad.rs"
+
+[[bin]]
+name = "parity_ideogram4_block_adjoint"
+path = "src/bin/parity_ideogram4_block_adjoint.rs"
+
+[[bin]]
+name = "parity_ideogram4_predict"
+path = "src/bin/parity_ideogram4_predict.rs"
+
+[[bin]]
+name = "parity_ideogram4_lora_b0"
+path = "src/bin/parity_ideogram4_lora_b0.rs"
+
+[[bin]]
+name = "parity_ideogram4_vae"
+path = "src/bin/parity_ideogram4_vae.rs"
+
+[[bin]]
+name = "parity_ideogram4_encoder"
+path = "src/bin/parity_ideogram4_encoder.rs"
+
+[[bin]]
 name = "train_acestep"
 path = "src/bin/train_acestep.rs"
 

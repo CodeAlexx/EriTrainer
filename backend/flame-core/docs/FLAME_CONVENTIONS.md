@@ -314,6 +314,33 @@ the smoke binary does (see `sdxl-trainer/src/bin/autograd_smoke.rs`
 for the template: synthesize fake inputs, run forward + MSE +
 backward, count params with grads + nonzero grads).
 
+#### Verifying backward *correctness* (not just existence) — the confound-free method
+
+The smoke binary checks grads are finite + nonzero, NOT that they point the
+right way. To verify a backward is *correct*, prefer the **adjoint test** for
+linear ops: for any linear `f`, the true backward is its adjoint, so
+`<f(x), G> == <x, fᵀ(G)>` exactly (build `loss=<f(x),G>`, backward, compare
+`<x, grad_x>`). It is **F32-exact** and avoids the two confounds that make the
+obvious checks lie:
+
+- **Cross-impl grad cosine is poisoned by forward drift.** Comparing LoRA/param
+  grads to another framework's autograd: a *correct* backward can read cosine
+  0.3–0.6 purely because the two forwards differ ~1–18% (BF16 accumulation over
+  30+ blocks), amplified through the Jacobian. A low cross-impl grad cosine is
+  NOT evidence of a backward bug.
+- **Finite-difference param self-consistency is poisoned by the BF16 param
+  cast.** `forward_delta` casts A/B to BF16, so a perturbation `B±αĝ` is rounded
+  on cast — the loss is a staircase, not the smooth quadratic FD assumes. Ratios
+  come out non-monotonic in α (a known "noise, not signal" signature). Even at a
+  cast-safe large α some modules don't clean up. Use the adjoint test instead.
+
+Verified 2026-06-23 (EriTrainer `parity_ideogram4_block_adjoint`, see
+`trainer/parity/IDEOGRAM_PARITY_LEDGER.md`): the Ideogram-4 block's 4-way
+last-dim `narrow` + `reshape` + `permute([0,2,1,3])` backward are all
+adjoint-correct (rel ≤ 7.6e-3); the contiguous-reshape control holds too. The
+cross-impl (0.30) and FD (<1) anomalies seen on that path were both the
+confounds above, not a bug.
+
 ### `contiguous()` and friends on non-contig views
 
 `Tensor::contiguous()` on a non-contig view (the typical post-`narrow` /

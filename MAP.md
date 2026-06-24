@@ -86,6 +86,7 @@ sampling, and checkpoint key layout.
 | anima | train_anima | `--dit-path` | required | no | no | Qwen3-0.6B + T5 |
 | hidream | **train_hidream_o1** | `--model-path` (dir) | optional | no | no | name reconciliation |
 | sd35 | train_sd35 | `--transformer` (file) | required | yes | no | 3 encoders; prep 1024-only |
+| ideogram4 | train_ideogram | `--model` (file) | optional | yes | no | FP8 transformer; save/sample/resume wired |
 
 Also wired: **l2p** (`train_l2p`, `--model`/`--cache`/`--output`/`--lora-rank`/
 `--train-shift`, grad-checkpoint on by default for the ~19.5GB pixel checkpoint).
@@ -95,11 +96,12 @@ against their real binaries at compile time: flux `--transformer`,
 qwenimage/acestep `--model`, ltx2 config-only, slider_klein
 `--config`+`--transformer`, asymflow `--config`+`--transformer`+`--asymflow-adapter`,
 wan22 `--config`+`--low-noise`[+`--high-noise`/`--vae`], u1 `--model-path`/`--steps`/`--lr`,
-and ideogram4 `train_ideogram`. Models without a recent finite-loss GPU smoke
+and the other registry-only bins. Models without a recent finite-loss GPU smoke
 remain **UNVERIFIED** in the UI.
 `config::model_verified()` returns false for them and the top bar shows an
 UNVERIFIED badge. `aux_model_path` carries the 2nd checkpoint (asymflow adapter,
-wan22 high-noise). They are NOT sampling-wired (sample_flags emits nothing).
+wan22 high-noise). Those remaining UI paths are NOT sampling-wired
+(`sample_flags` emits nothing).
 
 **Runner `--config` generation**: models requiring `--config` (klein/ernie/anima/
 sd35, see `needs_generated_config`) auto-write an EDv2-schema `TrainConfig` JSON
@@ -122,6 +124,10 @@ CLIP-G + T5 (+ tokenizers) are required, VAE is OPTIONAL (train_sd35 falls back
 to the main checkpoint's VAE). Verified live: klein + zimage + **sd35** produce
 real sample images — sd35 GPU smoke (sd3.5_medium + clip_l/clip_g/t5xxl_enconly,
 1024) rendered a coherent portrait, `cap=[1,154,4096] pooled=[1,2048]`.
+**ideogram4** now has trainer-side latent previews and a standalone
+`sample_ideogram` smoke path with prompt cache under `cache/text/`, but the UI
+Sampling tab still needs a dedicated Ideogram asset/flag pass before it should be
+treated as UI-complete.
 
 **Current dispatcher smoke evidence (2026-06-21):** `train --model sdxl` through
 `eritrainer-dispatch` ran one 512-cache step with
@@ -129,6 +135,10 @@ real sample images — sd35 GPU smoke (sd3.5_medium + clip_l/clip_g/t5xxl_enconl
 `/tmp/eritrainer_sdxl_smoke/sdxl_lora_1steps.safetensors` plus the ComfyUI/Kohya
 companion. This proves the unified dispatcher path, shared progress line,
 backward/optimizer step, and final save for one representative trainer.
+Ideogram standalone sampling was also smoke-tested at 256px/2 steps:
+`sample_ideogram` wrote `cache/text`, `cache/latents`, `manifests`, and three
+PNGs under `output/ideogram_sampler_test`; the second run hit all prompt caches
+and skipped Qwen text-encoder loading.
 
 ## 5. Where to start — add a model
 
@@ -150,6 +160,9 @@ backward/optimizer step, and final save for one representative trainer.
 - **`prepare_ernie` uses `--size`** (not `--resolution`) and has NO `--max-samples` (point it at a subset dir).
 - **Don't pipe `cargo … | tail`** when you need the exit code — `tail` masks it. Use `; echo "RC=$?"` without a pipe, or `${PIPESTATUS[0]}`.
 - **No xvfb in the sandbox** → the live GUI can't be smoke-run headless; the binary builds + `cargo test` cover everything except the visual.
+- **Ideogram-4 captions must be MINIFIED JSON.** ai-toolkit conditions ideogram on structured JSON (`high_level_description`/`style_description`/`compositional_deconstruction`+bboxes) and `digest_caption_string`→`to_model_string` **minifies** it before the encoder. `prepare_ideogram` currently encodes the **raw** caption file (`raw_cap.trim()`) — feed it toolkit's pretty (`indent=2`) JSON and you get ~29% extra whitespace/newline tokens vs toolkit (measured: 331 vs 257 on one caption) → off-distribution conditioning. Pre-minify the JSON (or add a minify step) before caching. Prose `.txt` is NOT what ideogram trains on. See `trainer/parity/IDEOGRAM_PARITY_LEDGER.md`.
+- **LR schedule defaults to Constant, but past ideogram runs baked cosine→~0.** `run_simple_step_trainer` uses `TrainConfig::default()` (Constant, `lr_min_factor 0`); a fresh `train_ideogram --lr 1e-4` holds 1e-4 (matches toolkit). The eri2 runs that "didn't learn" baked `lr=3.4e-11` (cosine-to-zero) — verify the effective schedule, don't assume the CLI flag is the whole story.
+- **Backward verification: use the adjoint test, not cross-impl grad cosine or param finite-difference** (both confound on bf16; see flame-core `docs/FLAME_CONVENTIONS.md` + the ledger). Ideogram block backward is adjoint-verified clean.
 
 ## 7. Related docs
 
