@@ -1,0 +1,547 @@
+{
+ "b_compute_aspect_ratio": [
+  {
+   "in": [
+    1024,
+    1024
+   ],
+   "out": "1:1"
+  },
+  {
+   "in": [
+    1920,
+    1080
+   ],
+   "out": "16:9"
+  },
+  {
+   "in": [
+    1080,
+    1920
+   ],
+   "out": "9:16"
+  },
+  {
+   "in": [
+    1023,
+    768
+   ],
+   "out": "4:3"
+  },
+  {
+   "in": [
+    512,
+    512
+   ],
+   "out": "1:1"
+  },
+  {
+   "in": [
+    0,
+    100
+   ],
+   "out": "1:1"
+  },
+  {
+   "in": [
+    100,
+    0
+   ],
+   "out": "1:1"
+  },
+  {
+   "in": [
+    3,
+    1
+   ],
+   "out": "3:1"
+  },
+  {
+   "in": [
+    1000,
+    1000
+   ],
+   "out": "1:1"
+  },
+  {
+   "in": [
+    1366,
+    768
+   ],
+   "out": "16:9"
+  },
+  {
+   "in": [
+    2,
+    3
+   ],
+   "out": "2:3"
+  },
+  {
+   "in": [
+    4000,
+    3000
+   ],
+   "out": "4:3"
+  }
+ ],
+ "b_build_prompt": [
+  {
+   "in": {
+    "caption_prompt": null,
+    "aspect_ratio": "1:1"
+   },
+   "out_sha256_len": [
+    "cd03f33b923b2f4e34a45edf683a64b7ff4bb59a7dcb5eb8fc75fad16041d8dc",
+    22802
+   ],
+   "out_head": "\n[META]\nfrozen: false\ndescription: Image -> structured JSON caption. Inverted v15 magic-prompt: observe-only discipline,",
+   "out_tail": " observe-only rule above — those are fixed.\n\nNone.\n\n[USER]\nTARGET IMAGE ASPECT RATIO: 1:1 (width:height).\nAnalyze the provided image and emit the JSON caption.\n"
+  },
+  {
+   "in": {
+    "caption_prompt": "",
+    "aspect_ratio": "16:9"
+   },
+   "out_sha256_len": [
+    "6ddaf4700233bcd80c77eda3600f946564af99b1d8436a8d028cb4b981aaa515",
+    22803
+   ],
+   "out_head": "\n[META]\nfrozen: false\ndescription: Image -> structured JSON caption. Inverted v15 magic-prompt: observe-only discipline,",
+   "out_tail": "observe-only rule above — those are fixed.\n\nNone.\n\n[USER]\nTARGET IMAGE ASPECT RATIO: 16:9 (width:height).\nAnalyze the provided image and emit the JSON caption.\n"
+  },
+  {
+   "in": {
+    "caption_prompt": "Focus on the dog.",
+    "aspect_ratio": "9:16"
+   },
+   "out_sha256_len": [
+    "0d341cbb7754bf5c3cbfc5146bf80452b3834ec7aa8d46fe8d1ef5ab31e8e181",
+    22815
+   ],
+   "out_head": "\n[META]\nfrozen: false\ndescription: Image -> structured JSON caption. Inverted v15 magic-prompt: observe-only discipline,",
+   "out_tail": " rule above — those are fixed.\n\nFocus on the dog.\n\n[USER]\nTARGET IMAGE ASPECT RATIO: 9:16 (width:height).\nAnalyze the provided image and emit the JSON caption.\n"
+  },
+  {
+   "in": {
+    "caption_prompt": "  spaced  ",
+    "aspect_ratio": "4:5"
+   },
+   "out_sha256_len": [
+    "4eb343b34e7bcf3f3dd8115cc8735c13641a723d49cc8f752feec8fed3ed7e39",
+    22803
+   ],
+   "out_head": "\n[META]\nfrozen: false\ndescription: Image -> structured JSON caption. Inverted v15 magic-prompt: observe-only discipline,",
+   "out_tail": "observe-only rule above — those are fixed.\n\nspaced\n\n[USER]\nTARGET IMAGE ASPECT RATIO: 4:5 (width:height).\nAnalyze the provided image and emit the JSON caption.\n"
+  }
+ ],
+ "b_convert_bbox": [
+  {
+   "in": [
+    100,
+    200,
+    300,
+    400
+   ],
+   "out": [
+    200,
+    100,
+    400,
+    300
+   ]
+  },
+  {
+   "in": [
+    400,
+    300,
+    200,
+    100
+   ],
+   "out": [
+    100,
+    200,
+    300,
+    400
+   ]
+  },
+  {
+   "in": [
+    -50,
+    50,
+    1200,
+    900
+   ],
+   "out": [
+    50,
+    0,
+    900,
+    1000
+   ]
+  },
+  {
+   "in": [
+    10,
+    10,
+    10,
+    400
+   ],
+   "out": null
+  },
+  {
+   "in": [
+    1,
+    2,
+    3
+   ],
+   "out": null
+  },
+  {
+   "in": "notalist",
+   "out": null
+  },
+  {
+   "in": [
+    10.6,
+    20.4,
+    300.5,
+    400.5
+   ],
+   "out": [
+    20,
+    11,
+    400,
+    300
+   ]
+  }
+ ],
+ "b_extract_json": [
+  {
+   "in": "{\"high_level_description\":\"a red apple\",\"compositional_deconstruction\":{\"background\":\"plain\",\"elements\":[]}}",
+   "out": {
+    "high_level_description": "a red apple",
+    "compositional_deconstruction": {
+     "background": "plain",
+     "elements": []
+    }
+   }
+  },
+  {
+   "in": "```json\n{\"high_level_description\":\"fenced\",\"compositional_deconstruction\":{\"background\":\"x\",\"elements\":[]}}\n```",
+   "out": {
+    "high_level_description": "fenced",
+    "compositional_deconstruction": {
+     "background": "x",
+     "elements": []
+    }
+   }
+  },
+  {
+   "in": "```\n{\"high_level_description\":\"bare fence\",\"compositional_deconstruction\":{\"background\":\"x\",\"elements\":[]}}\n```",
+   "out": {
+    "high_level_description": "bare fence",
+    "compositional_deconstruction": {
+     "background": "x",
+     "elements": []
+    }
+   }
+  },
+  {
+   "in": "Here is your caption:\n{\"high_level_description\":\"prose before\",\"compositional_deconstruction\":{\"background\":\"x\",\"elements\":[]}}\nDone.",
+   "out": {
+    "high_level_description": "prose before",
+    "compositional_deconstruction": {
+     "background": "x",
+     "elements": []
+    }
+   }
+  },
+  {
+   "in": "no json at all, just prose",
+   "out": null
+  },
+  {
+   "in": "{this is not valid json}",
+   "out": null
+  },
+  {
+   "in": "{\"a\":1} trailing prose {\"b\":2}",
+   "out": null
+  },
+  {
+   "in": "   ",
+   "out": null
+  }
+ ],
+ "b_full_glue": [
+  {
+   "in": "{\"high_level_description\":\"A red apple on a white table.\",\"style_description\":{\"aesthetics\":\"clean\",\"lighting\":\"soft daylight\",\"photo\":\"studio shot\",\"medium\":\"photograph\",\"color_palette\":[\"#ff0000\",\"#ffffff\"]},\"compositional_deconstruction\":{\"background\":\"plain white\",\"elements\":[{\"type\":\"obj\",\"bbox\":[200,100,400,300],\"desc\":\"a red apple\"},{\"type\":\"text\",\"bbox\":[20,10,40,30],\"text\":\"FRESH\",\"desc\":\"label\"}]}}",
+   "out": "{\n  \"high_level_description\": \"A red apple on a white table.\",\n  \"style_description\": {\n    \"aesthetics\": \"clean\",\n    \"lighting\": \"soft daylight\",\n    \"photo\": \"studio shot\",\n    \"medium\": \"photograph\",\n    \"color_palette\": [\n      \"#FF0000\",\n      \"#FFFFFF\"\n    ]\n  },\n  \"compositional_deconstruction\": {\n    \"background\": \"plain white\",\n    \"elements\": [\n      {\n        \"type\": \"obj\",\n        \"bbox\": [\n          100,\n          200,\n          300,\n          400\n        ],\n        \"desc\": \"a red apple\"\n      },\n      {\n        \"type\": \"text\",\n        \"bbox\": [\n          10,\n          20,\n          30,\n          40\n        ],\n        \"text\": \"FRESH\",\n        \"desc\": \"label\"\n      }\n    ]\n  }\n}"
+  },
+  {
+   "in": "```json\n{\"high_level_description\":\"A red apple on a white table.\",\"style_description\":{\"aesthetics\":\"clean\",\"lighting\":\"soft daylight\",\"photo\":\"studio shot\",\"medium\":\"photograph\",\"color_palette\":[\"#ff0000\",\"#ffffff\"]},\"compositional_deconstruction\":{\"background\":\"plain white\",\"elements\":[{\"type\":\"obj\",\"bbox\":[200,100,400,300],\"desc\":\"a red apple\"},{\"type\":\"text\",\"bbox\":[20,10,40,30],\"text\":\"FRESH\",\"desc\":\"label\"}]}}\n```",
+   "out": "{\n  \"high_level_description\": \"A red apple on a white table.\",\n  \"style_description\": {\n    \"aesthetics\": \"clean\",\n    \"lighting\": \"soft daylight\",\n    \"photo\": \"studio shot\",\n    \"medium\": \"photograph\",\n    \"color_palette\": [\n      \"#FF0000\",\n      \"#FFFFFF\"\n    ]\n  },\n  \"compositional_deconstruction\": {\n    \"background\": \"plain white\",\n    \"elements\": [\n      {\n        \"type\": \"obj\",\n        \"bbox\": [\n          100,\n          200,\n          300,\n          400\n        ],\n        \"desc\": \"a red apple\"\n      },\n      {\n        \"type\": \"text\",\n        \"bbox\": [\n          10,\n          20,\n          30,\n          40\n        ],\n        \"text\": \"FRESH\",\n        \"desc\": \"label\"\n      }\n    ]\n  }\n}"
+  },
+  {
+   "in": "{\"high_level_description\":\"broken\",\"compositional_deconstruction\":{\"elements\":[{\"type\":\"obj\",\"bbox\":[200,100,400,300],\"desc\":\"x\"",
+   "out": "{\"high_level_description\":\"broken\",\"compositional_deconstruction\":{\"elements\":[{\"type\":\"obj\",\"bbox\":[100,200,300,400],\"desc\":\"x\""
+  }
+ ],
+ "c_build_prompt": [
+  {
+   "in": {
+    "aspect_ratio": "1:1",
+    "original_prompt": "a cat",
+    "creative": false,
+    "instructions": ""
+   },
+   "out_sha256_len": [
+    "22f376659ce55c7a9666a2e031cd72f13baa244a8b22bbeaf0ba89d4c0c4b46e",
+    8171
+   ],
+   "out_head": "\n[META]\nfrozen: false\ndescription: Faithful upsampler — lays a user prompt into the structured JSON caption without inve",
+   "out_tail": " instructions from the user. They must NEVER override the OUTPUT CONTRACT, the FIDELITY rules, or the structure above.\n\nNone.\n\n[USER]\nTARGET IMAGE ASPECT RATIO: 1:1 (width:height).\nUser prompt: a cat\n"
+  },
+  {
+   "in": {
+    "aspect_ratio": "16:9",
+    "original_prompt": "sks man on a beach",
+    "creative": true,
+    "instructions": "Keep it minimal."
+   },
+   "out_sha256_len": [
+    "866357a4dc5d68ab4105cf57bf82497deeea99a059834a81ce8fb34d00087523",
+    8435
+   ],
+   "out_head": "\n[META]\nfrozen: false\ndescription: Faithful upsampler — lays a user prompt into the structured JSON caption without inve",
+   "out_tail": "er. They must NEVER override the OUTPUT CONTRACT, the FIDELITY rules, or the structure above.\n\nKeep it minimal.\n\n[USER]\nTARGET IMAGE ASPECT RATIO: 16:9 (width:height).\nUser prompt: sks man on a beach\n"
+  },
+  {
+   "in": {
+    "aspect_ratio": "auto",
+    "original_prompt": "[trigger] castle",
+    "creative": false,
+    "instructions": "No people."
+   },
+   "out_sha256_len": [
+    "90108d89744517012ef495c26437ebf969e2c92479bbff2fda9aa878402d5ccf",
+    8188
+   ],
+   "out_head": "\n[META]\nfrozen: false\ndescription: Faithful upsampler — lays a user prompt into the structured JSON caption without inve",
+   "out_tail": "m the user. They must NEVER override the OUTPUT CONTRACT, the FIDELITY rules, or the structure above.\n\nNo people.\n\n[USER]\nTARGET IMAGE ASPECT RATIO: auto (width:height).\nUser prompt: [trigger] castle\n"
+  }
+ ],
+ "c_sanitize_bbox": [
+  {
+   "in": [
+    100,
+    200,
+    300,
+    400
+   ],
+   "out": [
+    100,
+    200,
+    300,
+    400
+   ]
+  },
+  {
+   "in": [
+    400,
+    300,
+    200,
+    100
+   ],
+   "out": [
+    200,
+    100,
+    400,
+    300
+   ]
+  },
+  {
+   "in": [
+    -50,
+    50,
+    1200,
+    900
+   ],
+   "out": [
+    0,
+    50,
+    1000,
+    900
+   ]
+  },
+  {
+   "in": [
+    10,
+    10,
+    10,
+    400
+   ],
+   "out": null
+  },
+  {
+   "in": [
+    1,
+    2,
+    3
+   ],
+   "out": null
+  },
+  {
+   "in": "notalist",
+   "out": null
+  },
+  {
+   "in": [
+    10.6,
+    20.4,
+    300.5,
+    400.5
+   ],
+   "out": [
+    11,
+    20,
+    300,
+    400
+   ]
+  }
+ ],
+ "c_extract_json": [
+  {
+   "in": "{\"high_level_description\":\"a red apple\",\"compositional_deconstruction\":{\"background\":\"plain\",\"elements\":[]}}",
+   "out": {
+    "high_level_description": "a red apple",
+    "compositional_deconstruction": {
+     "background": "plain",
+     "elements": []
+    }
+   }
+  },
+  {
+   "in": "```json\n{\"high_level_description\":\"fenced\",\"compositional_deconstruction\":{\"background\":\"x\",\"elements\":[]}}\n```",
+   "out": {
+    "high_level_description": "fenced",
+    "compositional_deconstruction": {
+     "background": "x",
+     "elements": []
+    }
+   }
+  },
+  {
+   "in": "```\n{\"high_level_description\":\"bare fence\",\"compositional_deconstruction\":{\"background\":\"x\",\"elements\":[]}}\n```",
+   "out": {
+    "high_level_description": "bare fence",
+    "compositional_deconstruction": {
+     "background": "x",
+     "elements": []
+    }
+   }
+  },
+  {
+   "in": "Here is your caption:\n{\"high_level_description\":\"prose before\",\"compositional_deconstruction\":{\"background\":\"x\",\"elements\":[]}}\nDone.",
+   "out": {
+    "high_level_description": "prose before",
+    "compositional_deconstruction": {
+     "background": "x",
+     "elements": []
+    }
+   }
+  },
+  {
+   "in": "no json at all, just prose",
+   "out": null
+  },
+  {
+   "in": "{this is not valid json}",
+   "out": null
+  },
+  {
+   "in": "{\"a\":1} trailing prose {\"b\":2}",
+   "out": null
+  },
+  {
+   "in": "   ",
+   "out": null
+  }
+ ],
+ "c_normalize_item": [
+  {
+   "in": "a cat",
+   "default_ar": "1:1",
+   "out": [
+    "a cat",
+    "1:1"
+   ]
+  },
+  {
+   "in": {
+    "prompt": "a dog",
+    "aspect_ratio": "16:9"
+   },
+   "default_ar": "1:1",
+   "out": [
+    "a dog",
+    "16:9"
+   ]
+  },
+  {
+   "in": {
+    "prompt": "x"
+   },
+   "default_ar": "1:1",
+   "out": [
+    "x",
+    "1:1"
+   ]
+  },
+  {
+   "in": {
+    "prompt": "  "
+   },
+   "default_ar": "1:1",
+   "out": null
+  },
+  {
+   "in": "",
+   "default_ar": "1:1",
+   "out": null
+  },
+  {
+   "in": {
+    "noprompt": 1
+   },
+   "default_ar": "1:1",
+   "out": null
+  },
+  {
+   "in": 123,
+   "default_ar": "1:1",
+   "out": null
+  }
+ ],
+ "c_full_glue": [
+  {
+   "in": "{\"high_level_description\":\"sks dog running\",\"style_description\":{\"aesthetics\":\"playful\",\"lighting\":\"bright sun\",\"medium\":\"illustration\",\"art_style\":\"flat vector\",\"color_palette\":[\"#abc\",\"#123456\"]},\"compositional_deconstruction\":{\"background\":\"grass field\",\"elements\":[{\"type\":\"obj\",\"bbox\":[100,150,700,850],\"desc\":\"sks dog\"}]}}",
+   "out": "{\"high_level_description\": \"sks dog running\", \"style_description\": {\"aesthetics\": \"playful\", \"lighting\": \"bright sun\", \"medium\": \"illustration\", \"art_style\": \"flat vector\", \"color_palette\": [\"#AABBCC\", \"#123456\"]}, \"compositional_deconstruction\": {\"background\": \"grass field\", \"elements\": [{\"type\": \"obj\", \"bbox\": [100, 150, 700, 850], \"desc\": \"sks dog\"}]}}"
+  },
+  {
+   "in": "no json",
+   "out": null
+  }
+ ],
+ "c_template_anchors": {
+  "len": 7892,
+  "sha256": "7bf215b29f6587f72eb2f87077f88a6c960c929bb8dfc6fda8d70a06a0d90cb4",
+  "head": "\n[META]\nfrozen: false\ndescription: Faithful upsampler — lays a user prompt into ",
+  "tail": "ASPECT RATIO: {{aspect_ratio}} (width:height).\nUser prompt: {{original_prompt}}\n"
+ },
+ "b_template_anchors": {
+  "len": 22831,
+  "sha256": "9e9ce2a344f12de762f150a271c308fe53281609c2d5cc6cbc8c1145ef873885",
+  "head": "\n[META]\nfrozen: false\ndescription: Image -> structured JSON caption. Inverted v1",
+  "tail": "t_ratio}} (width:height).\nAnalyze the provided image and emit the JSON caption.\n"
+ }
+}

@@ -1,0 +1,35 @@
+# Standalone leaf crate: the deterministic Ideogram-4 caption normalizer/minifier
+# (module A, a 1:1 port of ai-toolkit `toolkit/ideogram_caption.py`) PLUS the
+# deterministic B/C captioner glue (module B = Ideogram4Captioner image->JSON,
+# module C = upsample_ideogram4_caption idea->JSON). It is INTENTIONALLY not a
+# member of any flame-core/CUDA workspace so `cargo test` here compiles in
+# seconds (serde_json + serde + indexmap + regex only — no torch, no CUDA, no
+# flame-core, NO LLM client deps). The ideogram4 dataloader/encoder can depend on
+# this via a path dependency without dragging in the heavy graph.
+[package]
+name = "ideogram-caption"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic Ideogram-4 structured-caption normalizer/minifier + B/C captioner glue (1:1 port of ai-toolkit)."
+
+[dependencies]
+# preserve_order keeps JSON object key order on BOTH parse and emit; serde_json's
+# `Map` is backed by IndexMap under this feature. Key order is load-bearing —
+# output must be byte-identical to Python's OrderedDict + json.dumps.
+#
+# arbitrary_precision stores every parsed JSON number as its source TOKEN instead
+# of an f64, so big integers beyond i64/u64 (`9999999999999999999999`,
+# `18446744073709551616`) and small/large floats (`1e-30`, `1e+30`) round-trip
+# byte-identically to CPython instead of being reformatted (`1e+22` / `9.99…e-31`)
+# — the B/C glue (F1) needs this because module A passes any non-bbox value
+# through verbatim, so an adversarial model could emit such a number. It does NOT
+# affect in-schema bbox ints (constructed `100` still emits `100`, not `100.0`).
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+# `serde` (no derive) supplies the `Serialize` trait so we can drive a custom
+# `serde_json::ser::Formatter` for C's `indent=None` default `", "/": "`
+# separators (B's `indent=2` is `serde_json::to_string_pretty`, verified to
+# byte-match CPython).
+serde = "1"
+# `regex` mirrors Python's `_BBOX_TEXT_RE` exactly for swap_bbox_xy_in_text and
+# the B/C `extract_json` ```json fence strip.
+regex = "1"
